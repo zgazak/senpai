@@ -67,10 +67,18 @@ class SenpaiCocoExporter:
         senpai_run: Union[SenpaiRun, SenpaiRunResult],
         collect_id: str,
         apply_calibrations: bool = True,
+        source_path=None,
     ) -> None:
-        """Export a single SENPAI run to individual COCO format files."""
+        """Export a single SENPAI run to individual COCO format files.
+
+        ``source_path`` is the run's JSON path; its sibling ``config.yaml`` is
+        used to rebuild processed frames in place when *_processed.fits is
+        absent (runs made with --no-processed-fits).
+        """
         # Store reference to senpai_run for scale_factor access
         self.senpai_run = senpai_run
+        self._source_path = source_path
+        self._build_cfg = "unset"  # reset per-run config cache
 
         # Process frames based on run type
         if isinstance(senpai_run, SenpaiRunResult):
@@ -90,6 +98,62 @@ class SenpaiCocoExporter:
             for frame in senpai_run.rate_track_frames:
                 self._process_rate_frame(frame, collect_id, apply_calibrations)
 
+    def _build_config(self):
+        """Config used to rebuild missing processed frames, loaded once from the
+        run's own ``config.yaml`` (next to the source JSON) so the in-place
+        preprocessing matches exactly what the night run did (same flat dir,
+        row/col-median settings, etc.). Returns an AppConfig or None if it can't
+        be resolved (then callers fall back to the raw, uncalibrated frame)."""
+        if getattr(self, "_build_cfg", "unset") != "unset":
+            return self._build_cfg
+        cfg = None
+        src = getattr(self, "_source_path", None)
+        try:
+            from senpai.core.config import AppConfig, load_yaml
+
+            if src:
+                cfg_path = Path(src).parent / "config.yaml"
+                if cfg_path.is_file():
+                    cfg = AppConfig(**load_yaml(cfg_path))  # load_yaml unwraps "app"
+            if cfg is None:
+                from senpai.core.config import get_config
+                cfg = get_config()  # raises if no run config + none initialized
+        except Exception as e:
+            logger.warning(
+                "No config for in-place processed-frame rebuild (%s); COCO will "
+                "use raw uncalibrated frames where *_processed.fits is missing", e)
+            cfg = None
+        self._build_cfg = cfg
+        return cfg
+
+    def _load_frame_image(self, frame, apply_calibrations: bool, label: str):
+        """(data, header, file_path) for a serialized frame.
+
+        Prefers the written ``*_processed.fits``. When it's absent — e.g. a run
+        made with ``--no-processed-fits`` — rebuild the processed frame IN PLACE
+        from the raw original via the configured preprocessing pipeline (the same
+        steps the night run applied), so COCO trains on calibrated frames instead
+        of silently falling back to raw. Returns (None, None, None) if no source.
+        """
+        if frame.processed_frame_path and os.path.exists(frame.processed_frame_path):
+            img = load_fits_file(frame.processed_frame_path)
+            return img.data, img.header, frame.processed_frame_path
+        if frame.original_frame_path and os.path.exists(frame.original_frame_path):
+            img = load_fits_file(frame.original_frame_path)
+            if apply_calibrations:
+                cfg = self._build_config()
+                if cfg is not None:
+                    from senpai.engine.utils.preprocessing import preprocess_image
+                    try:
+                        preprocess_image(img, cfg)
+                        logger.info("Built processed frame in place from raw for "
+                                    "%s (no *_processed.fits on disk)", label)
+                    except Exception as e:
+                        logger.warning("In-place preprocess failed for %s (%s); "
+                                       "using raw frame", label, e)
+            return img.data, img.header, frame.original_frame_path
+        return None, None, None
+
     def _process_sidereal_frame_serializable(
         self,
         frame,
@@ -105,41 +169,9 @@ class SenpaiCocoExporter:
             return
 
         # Load frame data - prefer processed FITS files if available
-        if frame.processed_frame_path and os.path.exists(frame.processed_frame_path):
-            # Use the processed/reduced FITS file directly
-            logger.debug(f"Loading processed frame data from {frame.processed_frame_path}")
-            processed_image = load_fits_file(frame.processed_frame_path)
-            frame_data = processed_image.data
-            header = processed_image.header
-            file_path = frame.processed_frame_path
-        elif frame.original_frame_path and os.path.exists(frame.original_frame_path):
-            # Fall back to original frame and apply calibrations
-            logger.debug(f"Loading original frame data from {frame.original_frame_path}")
-            processed_image = load_fits_file(frame.original_frame_path)
-            frame_data = processed_image.data
-            header = processed_image.header
-            file_path = frame.original_frame_path
-
-            # Apply calibrations if requested and we have processing history
-            if apply_calibrations and frame.processing_history:
-                logger.debug(f"Applying calibrations from processing history for sidereal frame {frame.index}")
-                # Convert correction frames back to numpy arrays if they exist
-                correction_frames = None
-                if frame.correction_frames:
-                    correction_frames = {}
-                    for step_type_str, correction_data in frame.correction_frames.items():
-                        if isinstance(correction_data, list):
-                            correction_frames[step_type_str] = np.array(correction_data)
-                        else:
-                            correction_frames[step_type_str] = correction_data
-
-                frame_data = self._apply_calibrations_from_processing_history(
-                    frame_data,
-                    header,
-                    frame.processing_history,
-                    correction_frames,
-                )
-        else:
+        frame_data, header, file_path = self._load_frame_image(
+            frame, apply_calibrations, f"sidereal frame {frame.index}")
+        if frame_data is None:
             logger.warning(f"No frame data available for sidereal frame {frame.index}")
             return
 
@@ -220,42 +252,11 @@ class SenpaiCocoExporter:
                 logger.info(f"Skipping rate frame {frame.index} - streak length {scaled_length:.1f} > {self.max_streak_length}")
                 return
 
-        # Load frame data - prefer processed FITS files if available
-        if frame.processed_frame_path and os.path.exists(frame.processed_frame_path):
-            # Use the processed/reduced FITS file directly
-            logger.debug(f"Loading processed frame data from {frame.processed_frame_path}")
-            processed_image = load_fits_file(frame.processed_frame_path)
-            frame_data = processed_image.data
-            header = processed_image.header
-            file_path = frame.processed_frame_path
-        elif frame.original_frame_path and os.path.exists(frame.original_frame_path):
-            # Fall back to original frame and apply calibrations
-            logger.debug(f"Loading original frame data from {frame.original_frame_path}")
-            processed_image = load_fits_file(frame.original_frame_path)
-            frame_data = processed_image.data
-            header = processed_image.header
-            file_path = frame.original_frame_path
-
-            # Apply calibrations if requested and we have processing history
-            if apply_calibrations and frame.processing_history:
-                logger.debug(f"Applying calibrations from processing history for rate frame {frame.index}")
-                # Convert correction frames back to numpy arrays if they exist
-                correction_frames = None
-                if frame.correction_frames:
-                    correction_frames = {}
-                    for step_type_str, correction_data in frame.correction_frames.items():
-                        if isinstance(correction_data, list):
-                            correction_frames[step_type_str] = np.array(correction_data)
-                        else:
-                            correction_frames[step_type_str] = correction_data
-
-                frame_data = self._apply_calibrations_from_processing_history(
-                    frame_data,
-                    header,
-                    frame.processing_history,
-                    correction_frames,
-                )
-        else:
+        # Load frame data - prefer the written *_processed.fits; rebuild in
+        # place from raw when absent (see _load_frame_image).
+        frame_data, header, file_path = self._load_frame_image(
+            frame, apply_calibrations, f"rate frame {frame.index}")
+        if frame_data is None:
             logger.warning(f"No frame data available for rate frame {frame.index}")
             return
 

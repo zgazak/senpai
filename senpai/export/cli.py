@@ -75,7 +75,7 @@ def export_single_run(
 
     # Export the run
     logger.info(f"Exporting SENPAI run {collect_id} to {output_dir}")
-    exporter.export_senpai_run(senpai_run, collect_id, apply_calibrations)
+    exporter.export_senpai_run(senpai_run, collect_id, apply_calibrations, source_path=run_path)
     logger.info("Export completed successfully")
 
 
@@ -123,7 +123,7 @@ def _export_run_worker(args):
             max_streak_length=max_streak_length,
         )
 
-        exporter.export_senpai_run(senpai_run, collect_id, apply_calibrations)
+        exporter.export_senpai_run(senpai_run, collect_id, apply_calibrations, source_path=run_file)
         logger.info(f"Successfully exported {collect_id}")
         return True, collect_id, None
     except Exception as e:
