@@ -4,7 +4,7 @@ import logging
 
 import numpy as np
 
-from senpai.engine.detection.point.sidereal import estimate_fwhm
+from senpai.engine.detection.point.sidereal import estimate_fwhm, sat_level_from_peaks
 from senpai.engine.models.metadata import FWHMMetadata
 
 logger = logging.getLogger(__name__)
@@ -46,9 +46,13 @@ def measure_fwhm_from_catalog_stars(
     # keep this step fast even when Gaia returns tens of thousands of stars.
     # We only need a modest number of well-isolated stars to get robust FWHM
     # statistics; beyond a few dozen measurements the median is very stable.
-    # Reduced from 300/60 to 100/30 — the median converges well within 30
-    # measurements and this cuts FWHM measurement time by ~60%.
-    MAX_CATALOG_FOR_FWHM = 100
+    # The candidate pool must reach well past the frame's saturated bright
+    # end though: the saturation limit moves ~2.5 mag between 1 s and 10 s
+    # exposures, and with a 100-star pool a long exposure's pool was almost
+    # entirely saturated/bloomed stars — Gaussian fits on those returned
+    # 2-3x the true FWHM, which (via FWHM-scaled apertures) silently
+    # destroyed long-exposure photometric SNR and depth.
+    MAX_CATALOG_FOR_FWHM = 400
     MAX_FWHM_MEASUREMENTS = 30
 
     # Filter to stars with valid positions
@@ -62,6 +66,19 @@ def measure_fwhm_from_catalog_stars(
     )
     if len(valid_catalog_stars) > MAX_CATALOG_FOR_FWHM:
         valid_catalog_stars = valid_catalog_stars[:MAX_CATALOG_FOR_FWHM]
+
+    # Per-frame saturation level from the candidates' own core peaks (the
+    # bright end piles up just under the clipped-and-subtracted ceiling);
+    # saturated stars are excluded from FWHM fitting below. Same logic the
+    # first-pass detection estimator uses — see sat_level_from_peaks.
+    data = fits_image.data
+    star_peaks: dict[int, float] = {}
+    for star in valid_catalog_stars:
+        x0, y0 = int(round(star.x)), int(round(star.y))
+        core = data[max(0, y0 - 2): y0 + 3, max(0, x0 - 2): x0 + 3]
+        if core.size:
+            star_peaks[id(star)] = float(core.max())
+    sat_level = sat_level_from_peaks(list(star_peaks.values()))
 
     # Build array of positions
     positions = np.array(
@@ -89,11 +106,16 @@ def measure_fwhm_from_catalog_stars(
         neighbor_mask = dist2 < r2_iso
         isolated_mask = ~neighbor_mask.any(axis=1)
 
+        n_saturated = 0
         for star, is_isolated in zip(valid_catalog_stars, isolated_mask, strict=False):
             if not is_isolated:
                 continue
             if len(fwhm_measurements) >= MAX_FWHM_MEASUREMENTS:
                 break
+            peak = star_peaks.get(id(star))
+            if peak is not None and peak >= sat_level:
+                n_saturated += 1
+                continue  # saturated/bloomed — a Gaussian fit returns garbage
 
             try:
                 fwhm = estimate_fwhm(fits_image.data, star.x, star.y)
@@ -107,6 +129,12 @@ def measure_fwhm_from_catalog_stars(
             except Exception as e:
                 logger.debug(f"FWHM estimation failed for catalog star: {e!s}")
                 continue
+
+        logger.info(
+            "Catalog FWHM sample: %d measured, %d saturated skipped (sat_level=%s)",
+            len(fwhm_measurements), n_saturated,
+            f"{sat_level:.0f}" if np.isfinite(sat_level) else "inf",
+        )
 
     # Combine with initial measurement
     fwhm_measurements.append(initial_fwhm)

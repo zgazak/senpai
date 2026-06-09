@@ -84,7 +84,14 @@ def estimate_fwhm(
     # with seeing.
     if cutout.size:
         peak = float(cutout.max())
-        if peak > 0 and int(np.count_nonzero(cutout >= peak - 1.0)) >= 4:
+        # Tolerance scales with peak: after row/col-median subtraction a
+        # clipped plateau is no longer flat-valued (pixels differ by the
+        # subtracted medians, tens-to-hundreds of ADU), so a ±1 ADU test
+        # never fires and bloomed cores reach the Gaussian fit. 0.5% of peak
+        # catches those plateaus while a real PSF keeps <2 px that close to
+        # its peak (the top 0.5% of a Gaussian is r < 0.1 sigma).
+        flat_tol = max(2.0, 0.005 * abs(peak))
+        if peak > 0 and int(np.count_nonzero(cutout >= peak - flat_tol)) >= 4:
             logger.debug(
                 "Skipping FWHM at (%d, %d): saturated/flat-topped core", x0, y0
             )
@@ -228,6 +235,14 @@ def _estimate_saturation_level(image: np.ndarray, sources) -> float:
         core = image[max(0, y0 - 2): y0 + 3, max(0, x0 - 2): x0 + 3]
         if core.size:
             peaks.append(float(core.max()))
+    return sat_level_from_peaks(peaks)
+
+
+def sat_level_from_peaks(peaks) -> float:
+    """Saturation level from a sample of source core peaks (see
+    _estimate_saturation_level for the rationale). Shared with the
+    catalog-star FWHM path, whose star sample suffers the same
+    saturated-pile-at-the-bright-end structure."""
     if len(peaks) < 10:
         return float("inf")  # too few sources to identify a saturated population
     peaks = np.asarray(peaks)
