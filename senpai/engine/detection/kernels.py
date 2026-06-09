@@ -49,6 +49,21 @@ def rectangle_pyramoid(
 
     width = int(width)
     length = int(length)
+
+    # Bound the supersampled intermediate. The kernel is built at `upsample`x
+    # resolution then PIL-rotated with expand=1, so the rotated bounding box
+    # grows as ~(max(width, length) * upsample)^2. At upsample=100 a long
+    # streak is catastrophic: L=600 builds a ~60000^2 float array (~15 GB),
+    # and a fast coverage target (L~800-1000) reached ~46 GB and drew the OOM
+    # killer (burr _full7). The 100x supersampling exists for sub-pixel
+    # accuracy of the streak *edges*; a long streak does not need 100 samples
+    # across its length. Cap the largest upsampled dimension so the
+    # intermediate stays bounded (~MAX_UPSAMPLED_DIM^2) regardless of length —
+    # the final resized kernel keeps the same pixel dimensions either way.
+    MAX_UPSAMPLED_DIM = 6000
+    longest = max(width, length, 1)
+    upsample = max(1, min(upsample, MAX_UPSAMPLED_DIM // longest))
+
     pyramid = np.ones((width * upsample, length * upsample))
     if verbose:
         logger.info("built base streak")
