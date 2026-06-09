@@ -74,9 +74,23 @@ def query_by_ra_dec_bounds(
         ra_mask |= (a["ra"] >= r0) & (a["ra"] <= r1)
     a = a[mask & ra_mask]
 
+    # Bound dict-building on ultra-dense (galactic-plane) fields: a single
+    # frame there can contain millions of stars (observed 2.57M), and building
+    # a dict per row then projecting/isolating them all before the caller's
+    # magnitude-stratified max_stars_per_frame cap (applied downstream) peaked
+    # ~26 GB and drew the OOM killer. Keep the brightest MAX_LOCAL_ROWS here;
+    # the downstream stratified cap subsamples this for completeness. The cut is
+    # far fainter than any per-frame cap, so normal fields are untouched.
+    MAX_LOCAL_ROWS = 200_000
+    n_raw = len(a)
+    if n_raw > MAX_LOCAL_ROWS:
+        idx = np.argpartition(a["g"], MAX_LOCAL_ROWS)[:MAX_LOCAL_ROWS]
+        a = a[idx]
+
     logger.info(
-        "Gaia local: %d stars from %d tiles (box RA[%.3f,%.3f] Dec[%.3f,%.3f] G<=%.1f)",
+        "Gaia local: %d stars from %d tiles (box RA[%.3f,%.3f] Dec[%.3f,%.3f] G<=%.1f)%s",
         len(a), len(chosen), min_ra, max_ra, min_dec, max_dec, faint_lim,
+        f" [capped from {n_raw} brightest-{MAX_LOCAL_ROWS}]" if n_raw > MAX_LOCAL_ROWS else "",
     )
     return [_to_star(r, primary_filter, faint_lim) for r in a]
 
