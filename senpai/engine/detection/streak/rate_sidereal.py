@@ -36,6 +36,22 @@ def solve_rate_from_sidereal(
 ):
     config = get_config()
 
+    # A fully-cloudy anchor gets no WCS, so its starfield (and detection
+    # metadata / fwhm) is None — reading it crashed the whole calsat batch.
+    # Mark the shift processed-but-invalid and skip, like solve_rate_from_rate,
+    # so the loop makes progress and the batch completes gracefully instead of
+    # failing (the frame is unusable without a WCS anyway).
+    if (sidereal_frame.starfield is None
+            or sidereal_frame.starfield.detection_metadata is None):
+        logger.warning(
+            "Skipping sidereal-rate shift %d->%d: missing starfield/WCS.",
+            frame_shift.source_index, frame_shift.target_index,
+        )
+        frame_shift.processed = True
+        frame_shift.is_valid = False
+        frame_shift.error_message = "Missing starfield (no WCS solution)"
+        return
+
     frame_exposure_gap_seconds = abs(
         (sidereal_frame.timestamp - rate_frame.timestamp).total_seconds()
     )
