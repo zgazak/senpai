@@ -63,6 +63,7 @@ class FramePhoto:
     # contaminant. Separation is field-center to Moon; alt < 0 means no glow.
     moon_sep_deg: float | None = None
     moon_alt_deg: float | None = None
+    fwhm_px: float | None = None  # sidereal PSF FWHM (detection_metadata)
 
     # Filter → ZP from the multiband calibration, when present.
     multiband_zps: dict[str, float] = field(default_factory=dict)
@@ -231,6 +232,13 @@ def _extract_frame_photo(
 
     track_mode = fmd.get("track_mode") or track_mode_default
 
+    # PSF FWHM (pixels) measured during detection — only meaningful on sidereal
+    # frames (rate frames are streaked; their cross-streak width is streak_fwhm).
+    fwhm_px = None
+    det_meta = (starfield or {}).get("detection_metadata") or {}
+    if track_mode != "rate":
+        fwhm_px = det_meta.get("pixel_fwhm")
+
     # Rate-track geometry — only meaningful on rate frames. (Burr leaves a
     # non-zero residual RA/DEC rate in the header even on the sidereal leg, so
     # we must not read a "track rate" off sidereal frames.)
@@ -276,6 +284,7 @@ def _extract_frame_photo(
         streak_fwhm_px=streak_fwhm_px,
         pixel_track_rate=pixel_track_rate,
         track_rate_arcsec_per_s=track_rate_arcsec_per_s,
+        fwhm_px=fwhm_px,
     )
 
 
@@ -511,36 +520,63 @@ def _fit_extinction(frames: list[FramePhoto]) -> dict[str, ExtinctionFit]:
         key = f.filter_name or "unknown"
         by_filter.setdefault(key, []).append((f.airmass, f.zero_point))
 
+    def _ols(xs, ys):
+        n = len(xs)
+        mean_x = sum(xs) / n
+        mean_y = sum(ys) / n
+        ssxx = sum((x - mean_x) ** 2 for x in xs)
+        ssxy = sum((xs[i] - mean_x) * (ys[i] - mean_y) for i in range(n))
+        if ssxx <= 0:
+            return None
+        slope = ssxy / ssxx
+        m0 = mean_y - slope * mean_x
+        resid = [ys[i] - (m0 + slope * xs[i]) for i in range(n)]
+        ss_res = sum(r * r for r in resid)
+        sigma2 = ss_res / max(n - 2, 1)
+        slope_err = math.sqrt(sigma2 / ssxx) if sigma2 > 0 else 0.0
+        m0_err = math.sqrt(sigma2 * (1 / n + mean_x * mean_x / ssxx)) if sigma2 > 0 else 0.0
+        return slope, m0, slope_err, m0_err, math.sqrt(sigma2)
+
     out: dict[str, ExtinctionFit] = {}
     for filt, pairs in by_filter.items():
         if len(pairs) < 3:
             continue
         xs = [p[0] for p in pairs]
         ys = [p[1] for p in pairs]
-        # Skip degenerate fits where airmass barely varies (e.g. a single
-        # pointing) — the slope would be wild extrapolation.
         if max(xs) - min(xs) < _MIN_AIRMASS_RANGE:
             continue
-        n = len(pairs)
-        mean_x = sum(xs) / n
-        mean_y = sum(ys) / n
-        ssxx = sum((x - mean_x) ** 2 for x in xs)
-        ssxy = sum((xs[i] - mean_x) * (ys[i] - mean_y) for i in range(n))
-        if ssxx <= 0:
+        # Robust Bouguer fit: cloud only ATTENUATES (drops ZP), so on a
+        # non-photometric night cloudy frames sit below the clear-sky line and
+        # a plain OLS over-steepens k (conflating cloud with extinction).
+        # Iteratively sigma-clip residuals (2.5σ) to reject the cloud dropouts
+        # while preserving the airmass slope. A flat ZP cut can't be used here:
+        # it would also reject high-airmass clear frames whose ZP is genuinely
+        # lower from extinction, flattening k to ~0.
+        fit = _ols(xs, ys)
+        if fit is None:
             continue
-        slope = ssxy / ssxx
-        m0 = mean_y - slope * mean_x
-        # Residual stderr against the actual fit line (slope, m0).
-        resid = [ys[i] - (m0 + slope * xs[i]) for i in range(n)]
-        ss_res = sum(r * r for r in resid)
-        sigma2 = ss_res / max(n - 2, 1)
-        slope_err = math.sqrt(sigma2 / ssxx) if sigma2 > 0 else 0.0
-        m0_err = math.sqrt(sigma2 * (1 / n + mean_x * mean_x / ssxx)) if sigma2 > 0 else 0.0
+        for _ in range(3):
+            slope, m0, _se, _me, sigma = fit
+            if sigma <= 0:
+                break
+            kept = [(x, y) for x, y in zip(xs, ys)
+                    if abs(y - (m0 + slope * x)) <= 2.5 * sigma]
+            if len(kept) == len(xs) or len(kept) < 3:
+                break
+            kxs = [p[0] for p in kept]
+            if max(kxs) - min(kxs) < _MIN_AIRMASS_RANGE:
+                break
+            xs, ys = kxs, [p[1] for p in kept]
+            refit = _ols(xs, ys)
+            if refit is None:
+                break
+            fit = refit
+        slope, m0, slope_err, m0_err, _sigma = fit
         out[filt] = ExtinctionFit(
             filter_name=filt,
             m0=m0, m0_err=m0_err,
             k=-slope, k_err=slope_err,  # extinction coefficient is -slope
-            n=n,
+            n=len(xs),
             airmass_range=(min(xs), max(xs)),
         )
     return out
@@ -894,6 +930,15 @@ def _data_extinction_curve(calib: NightCalibration):
         else:
             slope, intercept = np.polyfit(airmasses, offsets, 1)
             fit_note = "per-star fit"
+        # Overlay the robust frame-level Bouguer fit (the k reported in
+        # night_calibration.json). Per-star ZP and frame ZP share the same
+        # m + 2.5·log10(flux/t_exp) scale, so the two lines are directly
+        # comparable — showing both keeps the plot consistent with the JSON.
+        bfits = list(calib.extinction_per_filter.values())
+        bouguer = None
+        if bfits:
+            bf = max(bfits, key=lambda x: x.n)
+            bouguer = {"k": bf.k, "k_err": bf.k_err, "m0": bf.m0, "n": bf.n}
         return {
             "mode": "per_star",
             "airmass": airmasses, "offset": offsets,
@@ -901,6 +946,7 @@ def _data_extinction_curve(calib: NightCalibration):
                        "err_lo": err_lo, "err_hi": err_hi},
             "fit": {"slope": float(slope), "intercept": float(intercept),
                     "note": fit_note},
+            "bouguer": bouguer,
             "n_stars": int(len(airmasses)), "ext_min_snr": ext_min_snr,
         }
     zp_pts = [(f.airmass, f.zero_point, f.filter_name or "unknown")
@@ -937,8 +983,14 @@ def _render_extinction_curve(d, meta, output_dir, plt, np) -> Path:
         slope, intercept = d["fit"]["slope"], d["fit"]["intercept"]
         line_x = np.linspace(airmasses.min(), airmasses.max(), 50)
         ax.plot(line_x, slope * line_x + intercept, "r-", linewidth=2, alpha=0.8,
-                label=f"Extinction: k={-slope:.3f} mag/airmass "
+                label=f"per-star fit: k={-slope:.3f} mag/airmass "
                       f"({d['fit']['note']})")
+        bg = d.get("bouguer")
+        if bg is not None:
+            ax.plot(line_x, bg["m0"] - bg["k"] * line_x, color="darkorange",
+                    ls="--", linewidth=2, alpha=0.85,
+                    label=f"robust frame Bouguer: k={bg['k']:.3f}±{bg['k_err']:.3f} "
+                          f"(n={bg['n']})")
         ax.set_ylabel(r"per-star ZP (m$_{cat}$ + 2.5·log$_{10}$(flux/t$_{exp}$)) [mag]")
         ax.set_title(f"{meta['night_id']}: extinction curve ({d['n_stars']} "
                      f"isolated stars, sidereal, SNR≥{d['ext_min_snr']:.0f})")
@@ -1719,6 +1771,52 @@ _PLOT_BUILDERS.update({
         _data_snr_vs_exposure_6s_explained, _render_snr_vs_exposure_6s_explained),
     "snr_vs_moon_fixedmag": (
         _data_snr_vs_moon_fixedmag, _render_snr_vs_moon_fixedmag),
+})
+
+
+def _data_fwhm(calib: NightCalibration):
+    import numpy as np
+
+    pts = [(f.timestamp, f.fwhm_px, f.airmass) for f in calib.frames
+           if f.fwhm_px is not None and f.timestamp is not None]
+    if not pts:
+        return None
+    fw = [float(p[1]) for p in pts]
+    return {
+        "t": [p[0].isoformat() for p in pts],
+        "fwhm": fw,
+        "airmass": [float(p[2]) if p[2] is not None else 0.0 for p in pts],
+        "median_fwhm": float(np.median(fw)),
+        "p16": float(np.percentile(fw, 16)),
+        "p84": float(np.percentile(fw, 84)),
+    }
+
+
+def _render_fwhm(d, meta, output_dir, plt, np) -> Path:
+    from datetime import datetime as _dt
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    xs = [_dt.fromisoformat(t) for t in d["t"]]
+    cs = d["airmass"]
+    sc = ax.scatter(xs, d["fwhm"], c=cs, cmap="viridis", s=12, alpha=0.6)
+    ax.axhline(d["median_fwhm"], color="firebrick", ls="--", lw=1.5,
+               label=f"median = {d['median_fwhm']:.1f} px "
+                     f"(16/84: {d['p16']:.1f}–{d['p84']:.1f})")
+    if any(c > 0 for c in cs):
+        cb = plt.colorbar(sc, ax=ax)
+        cb.set_label("airmass")
+    ax.set_xlabel("UTC time")
+    ax.set_ylabel("PSF FWHM (pixels)")
+    ax.set_title(f"{meta['night_id']}: PSF FWHM over the night "
+                 f"(sidereal; flat trend = stable optics, ramp = focus drift)")
+    ax.legend(loc="best", fontsize=9)
+    ax.grid(True, alpha=0.3)
+    fig.autofmt_xdate()
+    return _save(fig, output_dir / "fwhm_vs_time.png")
+
+
+_PLOT_BUILDERS.update({
+    "fwhm_vs_time": (_data_fwhm, _render_fwhm),
 })
 
 
