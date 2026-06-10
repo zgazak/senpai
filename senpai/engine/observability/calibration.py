@@ -659,11 +659,76 @@ def save_calibration(calib: NightCalibration, output_dir: str | Path) -> Path:
     return path
 
 
-def plot_calibration(
-    calib: NightCalibration, output_dir: str | Path
-) -> list[Path]:
+def _jsonify(obj: Any) -> Any:
+    """Recursively convert numpy / datetime values to JSON-native types so the
+    plotted arrays round-trip through plot_data.json."""
+    import numpy as np
+
+    if isinstance(obj, dict):
+        return {k: _jsonify(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_jsonify(v) for v in obj]
+    if isinstance(obj, np.ndarray):
+        return _jsonify(obj.tolist())
+    if isinstance(obj, np.floating):
+        return float(obj)
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    return obj
+
+
+# Per-plot (analysis, render) functions, populated as plots migrate from
+# _render_legacy to the analysis-first split.
+#   analysis(calib) -> dict | None   (None = no data, plot skipped)
+#   render(data, meta, output_dir, plt, np) -> Path
+_PLOT_BUILDERS: dict[str, tuple] = {}
+
+
+def build_plot_data(calib: NightCalibration) -> dict:
+    """Run ALL calibration plot analysis up front and return a JSON-serializable
+    dict — the actual plotted arrays (gray clouds, binned points, fit lines),
+    not the raw per-frame data. This is the single analysis stage; renderers
+    consume only this dict, so plots can be regenerated from plot_data.json
+    without reprocessing the batch JSONs."""
+    meta = {
+        "night_id": calib.night_id,
+        "site": calib.site,
+        "moon_illumination": calib.moon_illumination,
+    }
+    plots: dict[str, Any] = {}
+    for name, (analysis, _render) in _PLOT_BUILDERS.items():
+        d = analysis(calib)
+        if d is not None:
+            plots[name] = d
+    return _jsonify({"version": 1, "meta": meta, "plots": plots})
+
+
+def save_plot_data(plot_data: dict, output_dir: str | Path) -> Path:
+    """Write the plotted-data dict to <output_dir>/plot_data.json."""
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path = output_dir / "plot_data.json"
+    with open(path, "w") as f:
+        json.dump(plot_data, f, indent=2)
+    logger.info("Wrote %s", path)
+    return path
+
+
+def load_plot_data(path: str | Path) -> dict:
+    """Load a previously written plot_data.json."""
+    with open(path) as f:
+        return json.load(f)
+
+
+def plot_calibration(source, output_dir: str | Path,
+                     *, save_data: bool = True) -> list[Path]:
     """Render the calibration plot set. Quietly skips plots that have no data.
 
+    ``source`` is either a NightCalibration (live: the analysis is run via
+    build_plot_data and, unless save_data=False, dumped to plot_data.json) or a
+    plot_data dict already loaded from plot_data.json (replot: no reprocessing).
     matplotlib is imported lazily so this module loads cheaply when only the
     aggregation is needed.
     """
@@ -677,6 +742,40 @@ def plot_calibration(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     paths: list[Path] = []
+
+    if isinstance(source, NightCalibration):
+        calib: NightCalibration | None = source
+        plot_data = build_plot_data(calib)
+        if save_data:
+            save_plot_data(plot_data, output_dir)
+    else:
+        calib = None
+        plot_data = source
+
+    meta = plot_data.get("meta", {})
+    for name, (_analysis, render) in _PLOT_BUILDERS.items():
+        d = plot_data.get("plots", {}).get(name)
+        if d is not None:
+            paths.append(render(d, meta, output_dir, plt, np))
+
+    # Plots not yet migrated to the split still render straight from calib
+    # (live runs only). Shrinks to nothing as plots move into _PLOT_BUILDERS.
+    if calib is not None:
+        _render_legacy(calib, output_dir, paths)
+    return paths
+
+
+def _render_legacy(
+    calib: NightCalibration, output_dir: Path, paths: list[Path]
+) -> None:
+    """Render plots not yet migrated to the build_plot_data/render split,
+    computing inline from calib.frames. Output is unchanged during migration."""
+
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import numpy as np
 
     # 1) Extinction curve: per-star ZP offset (m_cat − m_inst) vs airmass —
     #    gray cloud + airmass-binned medians + linear fit whose slope is −k.
@@ -1530,8 +1629,6 @@ def plot_calibration(
                 ax.legend(loc="lower right", fontsize=9)
                 paths.append(_save(fig, output_dir / "snr_vs_moon_fixedmag.png"))
 
-    return paths
-
 
 def _save(fig, path: Path) -> Path:
     import matplotlib.pyplot as plt
@@ -1570,10 +1667,19 @@ def main(argv: list[str] | None = None) -> int:
         "--no-plots", action="store_true",
         help="Skip plot rendering (faster; matplotlib not required).",
     )
+    parser.add_argument(
+        "--from-plot-data", action="store_true",
+        help="Skip reprocessing: render plots from an existing "
+             "<output>/plot_data.json instead of the batch JSONs.",
+    )
     args = parser.parse_args(argv)
 
     night_dir = Path(args.night_dir)
     out_dir = Path(args.output_dir) if args.output_dir else (night_dir / "calibration")
+
+    if args.from_plot_data:
+        plot_calibration(load_plot_data(out_dir / "plot_data.json"), out_dir)
+        return 0
 
     calib = analyze_night(night_dir)
     save_calibration(calib, out_dir)
