@@ -679,10 +679,11 @@ def _jsonify(obj: Any) -> Any:
     return obj
 
 
-# Per-plot (analysis, render) functions, populated as plots migrate from
-# _render_legacy to the analysis-first split.
+# Per-plot (analysis, render) functions driving the calibration plot set.
 #   analysis(calib) -> dict | None   (None = no data, plot skipped)
-#   render(data, meta, output_dir, plt, np) -> Path
+#   render(data, meta, output_dir, plt, np) -> Path | list[Path]
+# Registered after their definitions below; build_plot_data runs every analysis,
+# plot_calibration runs every render from the resulting plot_data dict.
 _PLOT_BUILDERS: dict[str, tuple] = {}
 
 
@@ -759,325 +760,7 @@ def plot_calibration(source, output_dir: str | Path,
             out = render(d, meta, output_dir, plt, np)
             paths.extend(out if isinstance(out, list) else [out])
 
-    # Plots not yet migrated to the split still render straight from calib
-    # (live runs only). Shrinks to nothing as plots move into _PLOT_BUILDERS.
-    if calib is not None:
-        _render_legacy(calib, output_dir, paths)
     return paths
-
-
-def _render_legacy(
-    calib: NightCalibration, output_dir: Path, paths: list[Path]
-) -> None:
-    """Render plots not yet migrated to the build_plot_data/render split,
-    computing inline from calib.frames. Output is unchanged during migration."""
-
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    import numpy as np
-
-    # Shared by the SNR/Moon blocks below (originally defined in now-migrated
-    # blocks: min_meas_snr from search-rate, _CAL_TASKS from snr-vs-mag).
-    min_meas_snr = 3.0
-    _CAL_TASKS = ("coverage", "photometric")
-
-    # 10) Moon geometry: frame pointings on the az/alt dome colored by Moon
-    #     separation, Moon track overlaid. On full-Moon nights the standard
-    #     fields (near the ecliptic) sit close to the Moon → high sky background.
-    moon_frames = [f for f in calib.frames
-                   if f.moon_sep_deg is not None and f.altitude_deg is not None
-                   and f.azimuth_deg is not None]
-    if moon_frames:
-        fig = plt.figure(figsize=(8, 8))
-        ax = fig.add_subplot(111, projection="polar")
-        ax.set_theta_zero_location("N")
-        ax.set_theta_direction(-1)
-        try:  # Moon track overlay (lazy astropy; omitted if unavailable)
-            from astropy.coordinates import AltAz, EarthLocation, get_body
-            from astropy.time import Time
-            from astropy import units as u
-            site = calib.site or {}
-            loc = EarthLocation(
-                lat=site["latitude"] * u.deg, lon=site["longitude"] * u.deg,
-                height=(site.get("altitude_km") or 0.0) * 1000.0 * u.m)
-            tss = [f.timestamp for f in moon_frames if f.timestamp]
-            t0, t1 = min(tss), max(tss)
-            tt = Time([t0 + (t1 - t0) * i / 60 for i in range(61)], scale="utc")
-            mtrk = get_body("moon", tt, loc).transform_to(
-                AltAz(obstime=tt, location=loc))
-            up = mtrk.alt.deg > 0
-            ax.plot(np.radians(mtrk.az.deg[up]), 90 - mtrk.alt.deg[up], "-",
-                    color="gold", lw=3, label="Moon track", zorder=3)
-        except Exception as e:
-            logger.debug("moon track overlay skipped: %s", e)
-        sc = ax.scatter([math.radians(f.azimuth_deg) for f in moon_frames],
-                        [90 - f.altitude_deg for f in moon_frames],
-                        c=[f.moon_sep_deg for f in moon_frames], s=14,
-                        cmap="viridis", alpha=0.75, zorder=2)
-        ax.set_ylim(0, 90)
-        ax.set_yticks([15, 30, 45, 60, 75])
-        ax.set_yticklabels([f"{90 - r}°" for r in [15, 30, 45, 60, 75]])
-        plt.colorbar(sc, ax=ax, pad=0.10, shrink=0.7, label="Moon separation (°)")
-        ax.legend(loc="lower left", fontsize=8)
-        illum = (f"{100 * calib.moon_illumination:.0f}% illuminated"
-                 if calib.moon_illumination is not None else "")
-        ax.set_title(f"{calib.night_id}: pointings + Moon ({illum})", pad=20)
-        paths.append(_save(fig, output_dir / "moon_az_el.png"))
-
-    # 11) ΔSNR vs Moon distance — the moonglow analogue of the extinction curve.
-    #     Each star's airmass-normalized SNR is divided by the median SNR for its
-    #     (exposure, 0.5-mag) cell on far-from-Moon frames (sep ≥ 60°), then put
-    #     in magnitudes: Δ = 2.5·log10(measured/baseline). Δ≈0 at large
-    #     separation, dropping as moonglow eats SNR. Uses every star
-    #     (mag-normalized), weather-masked; gray cloud + binned median + fit.
-    band = _clear_sky_zp_band(calib.frames)
-    if band is not None and any(f.moon_sep_deg is not None for f in calib.frames):
-        zp_mode, zp_sig = band
-        ext_k = {filt: fit.k for filt, fit in calib.extinction_per_filter.items()}
-        k_default = float(np.median(list(ext_k.values()))) if ext_k else 0.0
-        FAR = 60.0
-
-        def _norm_stars(f):
-            kk = ext_k.get(f.filter_name or "unknown", k_default)
-            corr = (10 ** (0.4 * kk * (f.airmass - 1.0))
-                    if f.airmass is not None else 1.0)
-            for m, s, iso in zip(f.stars_mag, f.stars_snr, _isolated_flags(f)):
-                if iso and m and s and s >= min_meas_snr and _snr_consistent(s, m, f):
-                    yield round(f.exposure_time), m, s * corr
-
-        masked = [f for f in _zp_frames(calib.frames)
-                  if f.zero_point is not None and f.exposure_time and f.stars_mag
-                  and abs(f.zero_point - zp_mode) <= zp_sig
-                  and f.moon_sep_deg is not None]
-        cells: dict[tuple, list] = {}
-        for f in masked:
-            if f.moon_sep_deg < FAR:
-                continue
-            for ex, m, s in _norm_stars(f):
-                cells.setdefault((ex, round(m * 2) / 2), []).append(s)
-        base_cell = {c: float(np.median(v)) for c, v in cells.items() if len(v) >= 5}
-        sep_arr, dmag_arr, mag_arr = [], [], []
-        for f in masked:
-            for ex, m, s in _norm_stars(f):
-                b = base_cell.get((ex, round(m * 2) / 2))
-                if b and b > 0:
-                    sep_arr.append(f.moon_sep_deg)
-                    dmag_arr.append(2.5 * math.log10(s / b))
-                    mag_arr.append(m)
-        # Bright-complete cutoff: stars brighter than this are detected at ALL
-        # separations (even the closest, shallowest-lim50 frames). The all-star
-        # curve is survivorship-biased near the Moon — faint penalized stars
-        # drop below the SNR floor and vanish, so the surviving median looks too
-        # good. Restricting to a magnitude complete everywhere removes that bias
-        # (cut = closest-Moon lim50 − 2.5 mag ≈ full completeness).
-        near_lims = [f.limiting_magnitude_50 for f in masked
-                     if f.moon_sep_deg < 30 and f.limiting_magnitude_50 is not None]
-        m_safe = (float(np.median(near_lims)) - 2.5) if near_lims else None
-        if len(sep_arr) >= 50:
-            sep_arr = np.array(sep_arr)
-            dmag_arr = np.array(dmag_arr)
-            mag_arr = np.array(mag_arr)
-            fig, ax = plt.subplots(figsize=(10, 7))
-            edges = np.arange(0, math.ceil(sep_arr.max() / 10) * 10 + 10, 10)
-
-            def _moon_series(mask, dot_color, dot_alpha, bin_color, fit_color, lab):
-                """Scatter + binned median±16/84 + linear fit for a star subset."""
-                ax.scatter(sep_arr[mask], dmag_arr[mask], s=6, alpha=dot_alpha,
-                           color=dot_color, zorder=1)
-                cx, cy, e_lo, e_hi = [], [], [], []
-                for lo, hi in zip(edges[:-1], edges[1:]):
-                    v = dmag_arr[mask & (sep_arr >= lo) & (sep_arr < hi)]
-                    if len(v) >= 20:
-                        md = float(np.median(v))
-                        cx.append((lo + hi) / 2)
-                        cy.append(md)
-                        e_lo.append(md - float(np.percentile(v, 16)))
-                        e_hi.append(float(np.percentile(v, 84)) - md)
-                if len(cx) >= 2:
-                    ax.errorbar(cx, cy, yerr=[e_lo, e_hi], fmt="o", color=bin_color,
-                                ms=7, capsize=4, capthick=1.5, elinewidth=1.5, zorder=5)
-                    slope, intercept = np.polyfit(cx, cy, 1)
-                    lx = np.linspace(min(cx), max(cx), 50)
-                    ax.plot(lx, slope * lx + intercept, "-", color=fit_color, lw=2,
-                            alpha=0.85, label=f"{lab}: {-slope * 10:+.2f} mag / 10° closer")
-
-            # All stars (survivorship-biased near the Moon): gray cloud, black
-            # binned medians, red fit.
-            _moon_series(np.ones(len(sep_arr), bool), "lightgray", 0.12,
-                         "black", "red", "all stars")
-            # Bright-complete (survivorship-free): blue cloud, binned, fit. If
-            # this stays flat while "all stars" droops, the Moon's harm is
-            # losing faint stars (depth/completeness), not degrading the SNR of
-            # stars bright enough to be detected anyway (they are source-limited,
-            # ~immune to sky background).
-            if m_safe is not None and (mag_arr < m_safe).sum() >= 50:
-                _moon_series(mag_arr < m_safe, "tab:blue", 0.08,
-                             "tab:blue", "tab:blue",
-                             f"bright m<{m_safe:.1f} (complete at all sep)")
-            ax.axhline(0, color="gray", ls=":")
-            illum = (f"{100 * calib.moon_illumination:.0f}%"
-                     if calib.moon_illumination is not None else "?")
-            ax.set_xlabel("Moon separation (°)")
-            ax.set_ylabel("ΔSNR [mag]  (0 = far-Moon baseline; negative = penalty)")
-            ax.set_title(f"{calib.night_id}: SNR penalty vs Moon distance "
-                         f"(Moon {illum}; all-stars vs bright-complete = "
-                         f"survivorship check)")
-            ax.grid(True, alpha=0.3)
-            ax.legend(loc="lower right", fontsize=9)
-            paths.append(_save(fig, output_dir / "snr_vs_moon_distance.png"))
-
-    # 12) SNR vs exposure at a FIXED (best-sampled) magnitude, curves binned by
-    #     MOON distance instead of magnitude. With magnitude locked, the vertical
-    #     spread between curves is the pure Moon penalty, and each curve is its
-    #     own √t ladder — so you see directly how moonglow scales with exposure
-    #     at a single brightness. Weather-masked, airmass-normalized, cal-tasks.
-    band = _clear_sky_zp_band(calib.frames)
-    if band is not None and any(f.moon_sep_deg is not None for f in calib.frames):
-        zp_mode, zp_sig = band
-        ext_k = {filt: fit.k for filt, fit in calib.extinction_per_filter.items()}
-        k_default = float(np.median(list(ext_k.values()))) if ext_k else 0.0
-        # (exposure, mag-bin) → star count, to pick the best-sampled magnitude.
-        usable = [f for f in _zp_frames(calib.frames)
-                  if f.zero_point is not None and f.exposure_time and f.stars_mag
-                  and abs(f.zero_point - zp_mode) <= zp_sig
-                  and _frame_task(f) in _CAL_TASKS and f.moon_sep_deg is not None]
-        mag_tot: dict[int, int] = {}
-        for f in usable:
-            for m, s, iso in zip(f.stars_mag, f.stars_snr, _isolated_flags(f)):
-                if iso and m and s and s >= min_meas_snr:
-                    mag_tot[int(m)] = mag_tot.get(int(m), 0) + 1
-        if mag_tot:
-            best_mag = max(mag_tot, key=mag_tot.get)  # densest 1-mag bin
-            # === Why the pooled SNR-vs-exposure "6s dip" is NOT an exposure
-            #     effect. At one magnitude, plot the two programs separately:
-            #     coverage (1/3/5 s) and photometric (1/6/10 s). Each follows √t
-            #     internally (points sit on their dashed √t reference), but the
-            #     whole photometric program sits below coverage — at EVERY
-            #     exposure including 1 s — a conditions offset (it observes near
-            #     the Moon, at higher airmass). The pooled curve only "dips" at
-            #     5→6 s because that is where it stops drawing coverage points
-            #     and starts drawing the lower photometric ones. 6 s is fine:
-            #     per-field (same field at 1/6/10 s) it delivers exactly √6× the
-            #     1 s SNR.
-            prog: dict[str, dict[int, list]] = {"coverage": {}, "photometric": {}}
-            for f in usable:
-                tk = _frame_task(f)
-                if tk not in prog:
-                    continue
-                corr = (10 ** (0.4 * ext_k.get(f.filter_name or "unknown", k_default)
-                               * (f.airmass - 1.0)) if f.airmass is not None else 1.0)
-                ex = round(f.exposure_time)
-                for m, s, iso in zip(f.stars_mag, f.stars_snr, _isolated_flags(f)):
-                    if (iso and m and s and s >= min_meas_snr
-                            and _snr_consistent(s, m, f)
-                            and best_mag <= m < best_mag + 1):
-                        prog[tk].setdefault(ex, []).append(s * corr)
-            pcolor = {"coverage": "tab:blue", "photometric": "tab:orange"}
-            if any(len(d) >= 2 for d in prog.values()):
-                fig, ax = plt.subplots(figsize=(10, 7))
-                for tk, d in prog.items():
-                    exps = sorted(ex for ex in d if len(d[ex]) >= 10)
-                    if len(exps) < 2:
-                        continue
-                    med = [float(np.median(d[ex])) for ex in exps]
-                    sem = [1.253 * float(np.std(d[ex])) / math.sqrt(len(d[ex]))
-                           for ex in exps]
-                    ax.errorbar(exps, med, yerr=sem, fmt="o", color=pcolor[tk],
-                                ms=9, capsize=4, zorder=5,
-                                label=f"{tk} (measured)")
-                    xr = np.linspace(exps[0], exps[-1], 50)
-                    ax.plot(xr, med[0] * np.sqrt(xr / exps[0]), "--",
-                            color=pcolor[tk], alpha=0.7,
-                            label=f"{tk}: √t from {exps[0]}s")
-                if prog["coverage"].get(1) and prog["photometric"].get(1):
-                    c1 = float(np.median(prog["coverage"][1]))
-                    p1 = float(np.median(prog["photometric"][1]))
-                    ax.annotate(
-                        f"photometric is {2.5 * math.log10(c1 / p1):+.2f} mag below "
-                        f"coverage\nat 1s — same offset at 6s/10s.\n"
-                        f"Whole-program shift (Moon + airmass),\nnot a 6s effect.",
-                        xy=(1, p1), xytext=(0.32, 0.10), textcoords="axes fraction",
-                        fontsize=9, ha="left",
-                        arrowprops=dict(arrowstyle="->", color="gray"))
-                ax.set_yscale("log")
-                ax.set_xticks(sorted({ex for d in prog.values() for ex in d
-                                      if len(d[ex]) >= 10}))
-                ax.set_xlabel("Exposure Time [seconds]")
-                ax.set_ylabel("SNR (normalized to airmass = 1)")
-                ax.set_title(
-                    f"{calib.night_id}: the pooled 6s 'dip' is a program offset, "
-                    f"not an exposure effect  (m_G≈{best_mag + 0.5:.1f})")
-                ax.grid(True, alpha=0.3, which="both")
-                ax.legend(loc="lower right", fontsize=8)
-                paths.append(_save(fig, output_dir / "snr_vs_exposure_6s_explained.png"))
-
-            # 13) The clean version of (12): lock the magnitude AND collapse
-            #     exposure via √t (SNR/√t_exp, valid since √t holds), so every
-            #     star at the fixed magnitude lands on ONE curve vs Moon
-            #     distance. This removes the field-to-field scatter that the
-            #     per-exposure split injects; with SEM error bars (median
-            #     precision, not the ×3 star-to-star 16/84 spread) the Moon
-            #     penalty is unambiguous and its onset (~45°) is visible.
-            # Local slope d log10(SNR/√t)/dmag from far-Moon (>60°) stars, to
-            # correct each star to the bin-center magnitude: a 14.0 star is
-            # intrinsically brighter (higher SNR) than a 14.99, so binning them
-            # raw adds spread. Correcting to the center removes that and lets a
-            # ±1 mag window contribute (more stars → smaller SEM).
-            target = best_mag + 0.5
-            sm, sl = [], []
-            for f in usable:
-                if f.moon_sep_deg < 60:
-                    continue
-                corr = (10 ** (0.4 * ext_k.get(f.filter_name or "unknown", k_default)
-                               * (f.airmass - 1.0)) if f.airmass is not None else 1.0)
-                rt = math.sqrt(f.exposure_time)
-                for m, s, iso in zip(f.stars_mag, f.stars_snr, _isolated_flags(f)):
-                    if (iso and m and s and s >= min_meas_snr
-                            and target - 2 <= m < target + 2):
-                        sm.append(m)
-                        sl.append(math.log10(s * corr / rt))
-            slope = float(np.polyfit(sm, sl, 1)[0]) if len(sm) >= 50 else -0.37
-            pts = []  # (moon_sep, SNR/√t corrected to the target magnitude)
-            for f in usable:
-                corr = (10 ** (0.4 * ext_k.get(f.filter_name or "unknown", k_default)
-                               * (f.airmass - 1.0)) if f.airmass is not None else 1.0)
-                rt = math.sqrt(f.exposure_time)
-                for m, s, iso in zip(f.stars_mag, f.stars_snr, _isolated_flags(f)):
-                    if (iso and m and s and s >= min_meas_snr
-                            and _snr_consistent(s, m, f)
-                            and target - 1 <= m < target + 1):
-                        pts.append((f.moon_sep_deg,
-                                    (s * corr / rt) * 10 ** (slope * (target - m))))
-            if len(pts) >= 100:
-                msep = np.array([p[0] for p in pts])
-                snrt = np.array([p[1] for p in pts])
-                fig, ax = plt.subplots(figsize=(10, 7))
-                ax.scatter(msep, snrt, s=6, alpha=0.10, color="lightgray",
-                           label="individual stars")
-                edges = np.arange(0, math.ceil(msep.max() / 10) * 10 + 10, 10)
-                cx, cy, cerr = [], [], []
-                for lo, hi in zip(edges[:-1], edges[1:]):
-                    v = snrt[(msep >= lo) & (msep < hi)]
-                    if len(v) >= 20:
-                        cx.append((lo + hi) / 2)
-                        cy.append(float(np.median(v)))
-                        cerr.append(1.253 * float(np.std(v)) / math.sqrt(len(v)))
-                if len(cx) >= 2:
-                    ax.errorbar(cx, cy, yerr=cerr, fmt="o-", color="black", ms=7,
-                                lw=1.5, capsize=4, capthick=1.5, elinewidth=1.5,
-                                zorder=5, label="binned median ± SEM")
-                ax.axvline(_MOON_SEP_MIN_DEG, color="red", ls="--", lw=1.5,
-                           label=f"Moon cut = {_MOON_SEP_MIN_DEG:.0f}°")
-                ax.set_xlabel("Moon separation (°)")
-                ax.set_ylabel(r"SNR / $\sqrt{t_{exp}}$ (airmass-normalized)")
-                ax.set_title(
-                    f"{calib.night_id}: Moon penalty at m_G={target:.1f} "
-                    f"(±1 mag corrected to center, √t-collapsed)")
-                ax.grid(True, alpha=0.3)
-                ax.legend(loc="lower right", fontsize=9)
-                paths.append(_save(fig, output_dir / "snr_vs_moon_fixedmag.png"))
 
 
 def _save(fig, path: Path) -> Path:
@@ -1684,6 +1367,357 @@ _PLOT_BUILDERS.update({
     "snr_vs_exposure": (_data_snr_vs_exposure, _render_snr_vs_exposure),
     "snr_vs_mag_weathermasked": (
         _data_snr_vs_mag_weathermasked, _render_snr_vs_mag_weathermasked),
+})
+
+
+def _data_moon_az_el(calib: NightCalibration):
+    import numpy as np
+
+    moon_frames = [f for f in calib.frames
+                   if f.moon_sep_deg is not None and f.altitude_deg is not None
+                   and f.azimuth_deg is not None]
+    if not moon_frames:
+        return None
+    track = None
+    try:
+        from astropy.coordinates import AltAz, EarthLocation, get_body
+        from astropy.time import Time
+        from astropy import units as u
+        site = calib.site or {}
+        loc = EarthLocation(
+            lat=site["latitude"] * u.deg, lon=site["longitude"] * u.deg,
+            height=(site.get("altitude_km") or 0.0) * 1000.0 * u.m)
+        tss = [f.timestamp for f in moon_frames if f.timestamp]
+        t0, t1 = min(tss), max(tss)
+        tt = Time([t0 + (t1 - t0) * i / 60 for i in range(61)], scale="utc")
+        mtrk = get_body("moon", tt, loc).transform_to(
+            AltAz(obstime=tt, location=loc))
+        up = mtrk.alt.deg > 0
+        track = {"theta": list(np.radians(mtrk.az.deg[up])),
+                 "r": list(90 - mtrk.alt.deg[up])}
+    except Exception as e:
+        logger.debug("moon track overlay skipped: %s", e)
+    return {
+        "theta": [math.radians(f.azimuth_deg) for f in moon_frames],
+        "r": [90 - f.altitude_deg for f in moon_frames],
+        "sep": [f.moon_sep_deg for f in moon_frames],
+        "track": track,
+    }
+
+
+def _render_moon_az_el(d, meta, output_dir, plt, np) -> Path:
+    fig = plt.figure(figsize=(8, 8))
+    ax = fig.add_subplot(111, projection="polar")
+    ax.set_theta_zero_location("N")
+    ax.set_theta_direction(-1)
+    if d["track"] is not None:
+        ax.plot(d["track"]["theta"], d["track"]["r"], "-", color="gold", lw=3,
+                label="Moon track", zorder=3)
+    sc = ax.scatter(d["theta"], d["r"], c=d["sep"], s=14, cmap="viridis",
+                    alpha=0.75, zorder=2)
+    ax.set_ylim(0, 90)
+    ax.set_yticks([15, 30, 45, 60, 75])
+    ax.set_yticklabels([f"{90 - r}°" for r in [15, 30, 45, 60, 75]])
+    plt.colorbar(sc, ax=ax, pad=0.10, shrink=0.7, label="Moon separation (°)")
+    ax.legend(loc="lower left", fontsize=8)
+    mi = meta.get("moon_illumination")
+    illum = f"{100 * mi:.0f}% illuminated" if mi is not None else ""
+    ax.set_title(f"{meta['night_id']}: pointings + Moon ({illum})", pad=20)
+    return _save(fig, output_dir / "moon_az_el.png")
+
+
+def _data_snr_vs_moon_distance(calib: NightCalibration):
+    import numpy as np
+
+    band = _clear_sky_zp_band(calib.frames)
+    if band is None or not any(f.moon_sep_deg is not None for f in calib.frames):
+        return None
+    zp_mode, zp_sig = band
+    ext_k = {filt: fit.k for filt, fit in calib.extinction_per_filter.items()}
+    k_default = float(np.median(list(ext_k.values()))) if ext_k else 0.0
+    min_meas_snr = 3.0
+    FAR = 60.0
+
+    def _norm_stars(f):
+        kk = ext_k.get(f.filter_name or "unknown", k_default)
+        corr = (10 ** (0.4 * kk * (f.airmass - 1.0))
+                if f.airmass is not None else 1.0)
+        for m, s, iso in zip(f.stars_mag, f.stars_snr, _isolated_flags(f)):
+            if iso and m and s and s >= min_meas_snr and _snr_consistent(s, m, f):
+                yield round(f.exposure_time), m, s * corr
+
+    masked = [f for f in _zp_frames(calib.frames)
+              if f.zero_point is not None and f.exposure_time and f.stars_mag
+              and abs(f.zero_point - zp_mode) <= zp_sig
+              and f.moon_sep_deg is not None]
+    cells: dict[tuple, list] = {}
+    for f in masked:
+        if f.moon_sep_deg < FAR:
+            continue
+        for ex, m, s in _norm_stars(f):
+            cells.setdefault((ex, round(m * 2) / 2), []).append(s)
+    base_cell = {c: float(np.median(v)) for c, v in cells.items() if len(v) >= 5}
+    sep_arr, dmag_arr, mag_arr = [], [], []
+    for f in masked:
+        for ex, m, s in _norm_stars(f):
+            b = base_cell.get((ex, round(m * 2) / 2))
+            if b and b > 0:
+                sep_arr.append(f.moon_sep_deg)
+                dmag_arr.append(2.5 * math.log10(s / b))
+                mag_arr.append(m)
+    near_lims = [f.limiting_magnitude_50 for f in masked
+                 if f.moon_sep_deg < 30 and f.limiting_magnitude_50 is not None]
+    m_safe = (float(np.median(near_lims)) - 2.5) if near_lims else None
+    if len(sep_arr) < 50:
+        return None
+    sep_arr = np.array(sep_arr)
+    dmag_arr = np.array(dmag_arr)
+    mag_arr = np.array(mag_arr)
+    edges = np.arange(0, math.ceil(sep_arr.max() / 10) * 10 + 10, 10)
+
+    def _series(mask, name, dot_color, dot_alpha, bin_color, fit_color):
+        cx, cy, e_lo, e_hi = [], [], [], []
+        for lo, hi in zip(edges[:-1], edges[1:]):
+            v = dmag_arr[mask & (sep_arr >= lo) & (sep_arr < hi)]
+            if len(v) >= 20:
+                md = float(np.median(v))
+                cx.append((lo + hi) / 2)
+                cy.append(md)
+                e_lo.append(md - float(np.percentile(v, 16)))
+                e_hi.append(float(np.percentile(v, 84)) - md)
+        fit = None
+        if len(cx) >= 2:
+            slope, intercept = np.polyfit(cx, cy, 1)
+            fit = {"slope": float(slope), "intercept": float(intercept)}
+        return {"name": name, "sep": list(sep_arr[mask]),
+                "dmag": list(dmag_arr[mask]),
+                "binned": {"x": cx, "y": cy, "e_lo": e_lo, "e_hi": e_hi},
+                "fit": fit, "dot_color": dot_color, "dot_alpha": dot_alpha,
+                "bin_color": bin_color, "fit_color": fit_color}
+
+    series = [_series(np.ones(len(sep_arr), bool), "all stars",
+                      "lightgray", 0.12, "black", "red")]
+    if m_safe is not None and (mag_arr < m_safe).sum() >= 50:
+        series.append(_series(
+            mag_arr < m_safe, f"bright m<{m_safe:.1f} (complete at all sep)",
+            "tab:blue", 0.08, "tab:blue", "tab:blue"))
+    return {"series": series}
+
+
+def _render_snr_vs_moon_distance(d, meta, output_dir, plt, np) -> Path:
+    fig, ax = plt.subplots(figsize=(10, 7))
+    for s in d["series"]:
+        ax.scatter(s["sep"], s["dmag"], s=6, alpha=s["dot_alpha"],
+                   color=s["dot_color"], zorder=1)
+        b = s["binned"]
+        if b["x"]:
+            ax.errorbar(b["x"], b["y"], yerr=[b["e_lo"], b["e_hi"]], fmt="o",
+                        color=s["bin_color"], ms=7, capsize=4, capthick=1.5,
+                        elinewidth=1.5, zorder=5)
+        if s["fit"] is not None:
+            slope, intercept = s["fit"]["slope"], s["fit"]["intercept"]
+            lx = np.linspace(min(b["x"]), max(b["x"]), 50)
+            ax.plot(lx, slope * lx + intercept, "-", color=s["fit_color"],
+                    lw=2, alpha=0.85,
+                    label=f"{s['name']}: {-slope * 10:+.2f} mag / 10° closer")
+    ax.axhline(0, color="gray", ls=":")
+    mi = meta.get("moon_illumination")
+    illum = f"{100 * mi:.0f}%" if mi is not None else "?"
+    ax.set_xlabel("Moon separation (°)")
+    ax.set_ylabel("ΔSNR [mag]  (0 = far-Moon baseline; negative = penalty)")
+    ax.set_title(f"{meta['night_id']}: SNR penalty vs Moon distance "
+                 f"(Moon {illum}; all-stars vs bright-complete = "
+                 f"survivorship check)")
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="lower right", fontsize=9)
+    return _save(fig, output_dir / "snr_vs_moon_distance.png")
+
+
+def _usable_cal_frames(calib, zp_mode, zp_sig):
+    """Weather-masked calibration-taskset frames with Moon geometry (shared by
+    the two fixed-magnitude Moon plots)."""
+    return [f for f in _zp_frames(calib.frames)
+            if f.zero_point is not None and f.exposure_time and f.stars_mag
+            and abs(f.zero_point - zp_mode) <= zp_sig
+            and _frame_task(f) in ("coverage", "photometric")
+            and f.moon_sep_deg is not None]
+
+
+def _best_sampled_mag(usable, min_meas_snr):
+    mag_tot: dict[int, int] = {}
+    for f in usable:
+        for m, s, iso in zip(f.stars_mag, f.stars_snr, _isolated_flags(f)):
+            if iso and m and s and s >= min_meas_snr:
+                mag_tot[int(m)] = mag_tot.get(int(m), 0) + 1
+    return max(mag_tot, key=mag_tot.get) if mag_tot else None
+
+
+def _data_snr_vs_exposure_6s_explained(calib: NightCalibration):
+    import numpy as np
+
+    band = _clear_sky_zp_band(calib.frames)
+    if band is None or not any(f.moon_sep_deg is not None for f in calib.frames):
+        return None
+    zp_mode, zp_sig = band
+    ext_k = {filt: fit.k for filt, fit in calib.extinction_per_filter.items()}
+    k_default = float(np.median(list(ext_k.values()))) if ext_k else 0.0
+    min_meas_snr = 3.0
+    usable = _usable_cal_frames(calib, zp_mode, zp_sig)
+    best_mag = _best_sampled_mag(usable, min_meas_snr)
+    if best_mag is None:
+        return None
+    prog = {"coverage": {}, "photometric": {}}
+    for f in usable:
+        tk = _frame_task(f)
+        if tk not in prog:
+            continue
+        corr = (10 ** (0.4 * ext_k.get(f.filter_name or "unknown", k_default)
+                       * (f.airmass - 1.0)) if f.airmass is not None else 1.0)
+        ex = round(f.exposure_time)
+        for m, s, iso in zip(f.stars_mag, f.stars_snr, _isolated_flags(f)):
+            if (iso and m and s and s >= min_meas_snr
+                    and _snr_consistent(s, m, f) and best_mag <= m < best_mag + 1):
+                prog[tk].setdefault(ex, []).append(s * corr)
+    if not any(len(dd) >= 2 for dd in prog.values()):
+        return None
+    out_prog = {}
+    for tk, dd in prog.items():
+        exps = sorted(ex for ex in dd if len(dd[ex]) >= 10)
+        if len(exps) < 2:
+            continue
+        out_prog[tk] = {
+            "exps": exps,
+            "med": [float(np.median(dd[ex])) for ex in exps],
+            "sem": [1.253 * float(np.std(dd[ex])) / math.sqrt(len(dd[ex]))
+                    for ex in exps],
+        }
+    annotation = None
+    if prog["coverage"].get(1) and prog["photometric"].get(1):
+        c1 = float(np.median(prog["coverage"][1]))
+        p1 = float(np.median(prog["photometric"][1]))
+        annotation = {"p1": p1, "delta": 2.5 * math.log10(c1 / p1)}
+    xticks = sorted({ex for dd in prog.values() for ex in dd
+                     if len(dd[ex]) >= 10})
+    return {"best_mag": best_mag, "prog": out_prog,
+            "annotation": annotation, "xticks": xticks}
+
+
+def _render_snr_vs_exposure_6s_explained(d, meta, output_dir, plt, np) -> Path:
+    pcolor = {"coverage": "tab:blue", "photometric": "tab:orange"}
+    fig, ax = plt.subplots(figsize=(10, 7))
+    for tk, dd in d["prog"].items():
+        exps, med, sem = dd["exps"], dd["med"], dd["sem"]
+        ax.errorbar(exps, med, yerr=sem, fmt="o", color=pcolor[tk], ms=9,
+                    capsize=4, zorder=5, label=f"{tk} (measured)")
+        xr = np.linspace(exps[0], exps[-1], 50)
+        ax.plot(xr, med[0] * np.sqrt(xr / exps[0]), "--", color=pcolor[tk],
+                alpha=0.7, label=f"{tk}: √t from {exps[0]}s")
+    ann = d["annotation"]
+    if ann is not None:
+        ax.annotate(
+            f"photometric is {ann['delta']:+.2f} mag below coverage\n"
+            f"at 1s — same offset at 6s/10s.\n"
+            f"Whole-program shift (Moon + airmass),\nnot a 6s effect.",
+            xy=(1, ann["p1"]), xytext=(0.32, 0.10), textcoords="axes fraction",
+            fontsize=9, ha="left",
+            arrowprops=dict(arrowstyle="->", color="gray"))
+    ax.set_yscale("log")
+    if d["xticks"]:
+        ax.set_xticks(d["xticks"])
+    ax.set_xlabel("Exposure Time [seconds]")
+    ax.set_ylabel("SNR (normalized to airmass = 1)")
+    ax.set_title(
+        f"{meta['night_id']}: the pooled 6s 'dip' is a program offset, "
+        f"not an exposure effect  (m_G≈{d['best_mag'] + 0.5:.1f})")
+    ax.grid(True, alpha=0.3, which="both")
+    ax.legend(loc="lower right", fontsize=8)
+    return _save(fig, output_dir / "snr_vs_exposure_6s_explained.png")
+
+
+def _data_snr_vs_moon_fixedmag(calib: NightCalibration):
+    import numpy as np
+
+    band = _clear_sky_zp_band(calib.frames)
+    if band is None or not any(f.moon_sep_deg is not None for f in calib.frames):
+        return None
+    zp_mode, zp_sig = band
+    ext_k = {filt: fit.k for filt, fit in calib.extinction_per_filter.items()}
+    k_default = float(np.median(list(ext_k.values()))) if ext_k else 0.0
+    min_meas_snr = 3.0
+    usable = _usable_cal_frames(calib, zp_mode, zp_sig)
+    best_mag = _best_sampled_mag(usable, min_meas_snr)
+    if best_mag is None:
+        return None
+    target = best_mag + 0.5
+    sm, sl = [], []
+    for f in usable:
+        if f.moon_sep_deg < 60:
+            continue
+        corr = (10 ** (0.4 * ext_k.get(f.filter_name or "unknown", k_default)
+                       * (f.airmass - 1.0)) if f.airmass is not None else 1.0)
+        rt = math.sqrt(f.exposure_time)
+        for m, s, iso in zip(f.stars_mag, f.stars_snr, _isolated_flags(f)):
+            if (iso and m and s and s >= min_meas_snr
+                    and target - 2 <= m < target + 2):
+                sm.append(m)
+                sl.append(math.log10(s * corr / rt))
+    slope = float(np.polyfit(sm, sl, 1)[0]) if len(sm) >= 50 else -0.37
+    pts = []
+    for f in usable:
+        corr = (10 ** (0.4 * ext_k.get(f.filter_name or "unknown", k_default)
+                       * (f.airmass - 1.0)) if f.airmass is not None else 1.0)
+        rt = math.sqrt(f.exposure_time)
+        for m, s, iso in zip(f.stars_mag, f.stars_snr, _isolated_flags(f)):
+            if (iso and m and s and s >= min_meas_snr
+                    and _snr_consistent(s, m, f)
+                    and target - 1 <= m < target + 1):
+                pts.append((f.moon_sep_deg,
+                            (s * corr / rt) * 10 ** (slope * (target - m))))
+    if len(pts) < 100:
+        return None
+    msep = np.array([p[0] for p in pts])
+    snrt = np.array([p[1] for p in pts])
+    edges = np.arange(0, math.ceil(msep.max() / 10) * 10 + 10, 10)
+    cx, cy, cerr = [], [], []
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        v = snrt[(msep >= lo) & (msep < hi)]
+        if len(v) >= 20:
+            cx.append((lo + hi) / 2)
+            cy.append(float(np.median(v)))
+            cerr.append(1.253 * float(np.std(v)) / math.sqrt(len(v)))
+    return {"target": target, "sep": list(msep), "snrt": list(snrt),
+            "binned": {"x": cx, "y": cy, "err": cerr},
+            "moon_cut": _MOON_SEP_MIN_DEG}
+
+
+def _render_snr_vs_moon_fixedmag(d, meta, output_dir, plt, np) -> Path:
+    fig, ax = plt.subplots(figsize=(10, 7))
+    ax.scatter(d["sep"], d["snrt"], s=6, alpha=0.10, color="lightgray",
+               label="individual stars")
+    b = d["binned"]
+    if b["x"]:
+        ax.errorbar(b["x"], b["y"], yerr=b["err"], fmt="o-", color="black",
+                    ms=7, lw=1.5, capsize=4, capthick=1.5, elinewidth=1.5,
+                    zorder=5, label="binned median ± SEM")
+    ax.axvline(d["moon_cut"], color="red", ls="--", lw=1.5,
+               label=f"Moon cut = {d['moon_cut']:.0f}°")
+    ax.set_xlabel("Moon separation (°)")
+    ax.set_ylabel(r"SNR / $\sqrt{t_{exp}}$ (airmass-normalized)")
+    ax.set_title(f"{meta['night_id']}: Moon penalty at m_G={d['target']:.1f} "
+                 f"(±1 mag corrected to center, √t-collapsed)")
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="lower right", fontsize=9)
+    return _save(fig, output_dir / "snr_vs_moon_fixedmag.png")
+
+
+_PLOT_BUILDERS.update({
+    "moon_az_el": (_data_moon_az_el, _render_moon_az_el),
+    "snr_vs_moon_distance": (
+        _data_snr_vs_moon_distance, _render_snr_vs_moon_distance),
+    "snr_vs_exposure_6s_explained": (
+        _data_snr_vs_exposure_6s_explained, _render_snr_vs_exposure_6s_explained),
+    "snr_vs_moon_fixedmag": (
+        _data_snr_vs_moon_fixedmag, _render_snr_vs_moon_fixedmag),
 })
 
 
