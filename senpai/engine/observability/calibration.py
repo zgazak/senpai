@@ -63,8 +63,10 @@ class FramePhoto:
     # contaminant. Separation is field-center to Moon; alt < 0 means no glow.
     moon_sep_deg: float | None = None
     moon_alt_deg: float | None = None
-    fwhm_px: float | None = None  # sidereal PSF FWHM (detection_metadata)
+    fwhm_px: float | None = None  # sidereal PSF FWHM median (detection_metadata)
+    fwhm_std_px: float | None = None  # PSF FWHM spread across the field
     sky_adu: float | None = None  # flat-fielded sky level before row/col subtract
+    pixel_scale_arcsec: float | None = None  # arcsec/pixel (x_fov / width)
 
     # Filter → ZP from the multiband calibration, when present.
     multiband_zps: dict[str, float] = field(default_factory=dict)
@@ -115,6 +117,19 @@ def _airmass(altitude_deg: float | None) -> float | None:
         return None
     z = math.radians(90.0 - altitude_deg)
     return 1.0 / math.cos(z)
+
+
+def _sky_mu(f: "FramePhoto") -> float | None:
+    """Sky surface brightness in mag/arcsec², from the captured flat-fielded sky
+    level. With m = ZP − 2.5·log10(flux/t_exp), one pixel's sky flux is at
+    m_pix = ZP − 2.5·log10(sky_adu/t_exp); converting per-pixel → per-arcsec²
+    adds 2.5·log10(pixel_area) = 5·log10(pixscale). Returns None if any input
+    (ZP / sky / exposure / plate scale) is missing."""
+    if (f.zero_point is None or f.sky_adu is None or f.sky_adu <= 0
+            or not f.exposure_time or not f.pixel_scale_arcsec):
+        return None
+    return (f.zero_point - 2.5 * math.log10(f.sky_adu / f.exposure_time)
+            + 5.0 * math.log10(f.pixel_scale_arcsec))
 
 
 def _compute_alt_az(
@@ -235,10 +250,19 @@ def _extract_frame_photo(
 
     # PSF FWHM (pixels) measured during detection — only meaningful on sidereal
     # frames (rate frames are streaked; their cross-streak width is streak_fwhm).
-    fwhm_px = None
+    fwhm_px = fwhm_std_px = None
     det_meta = (starfield or {}).get("detection_metadata") or {}
     if track_mode != "rate":
         fwhm_px = det_meta.get("pixel_fwhm")
+        fwhm_std_px = (det_meta.get("fwhm_stats") or {}).get("std_fwhm")
+
+    # Plate scale (arcsec/pixel) from the WCS field-of-view and image width —
+    # needed to put the sky background in mag/arcsec².
+    pixel_scale_arcsec = None
+    img_meta = (starfield or {}).get("image_metadata") or {}
+    img_w = img_meta.get("width")
+    if fov_x and img_w:
+        pixel_scale_arcsec = float(fov_x) * 3600.0 / float(img_w)
 
     # Physical sky level (ADU), captured pre-row/col-subtraction in the
     # column-median step metadata (only present on runs after that capture
@@ -296,7 +320,9 @@ def _extract_frame_photo(
         pixel_track_rate=pixel_track_rate,
         track_rate_arcsec_per_s=track_rate_arcsec_per_s,
         fwhm_px=fwhm_px,
+        fwhm_std_px=fwhm_std_px,
         sky_adu=sky_adu,
+        pixel_scale_arcsec=pixel_scale_arcsec,
     )
 
 
@@ -328,6 +354,7 @@ class ExtinctionFit:
     k_err: float
     n: int
     airmass_range: tuple[float, float]
+    clear_fraction: float | None = None  # frac of frames near the clear-sky line
 
 
 @dataclass(slots=True)
@@ -347,6 +374,40 @@ class NightCalibration:
     limiting_mag_p90_per_filter: dict[str, float] = field(default_factory=dict)
     moon_illumination: float | None = None  # 0–1 fraction at mid-night
 
+    def conditions(self) -> dict[str, Any]:
+        """One-line-per-night observing-conditions summary (PSF, sky, extinction,
+        Moon) for cross-night tracking. Medians over the night's frames."""
+        import statistics as st
+
+        def _med(xs):
+            xs = [x for x in xs if x is not None]
+            return float(st.median(xs)) if xs else None
+
+        fwhm = _med([f.fwhm_px for f in self.frames])
+        fwhm_spread = _med([f.fwhm_std_px for f in self.frames])
+        sky_adu = _med([f.sky_adu for f in self.frames])
+        sky_mu = _med([_sky_mu(f) for f in self.frames])
+        moon_sep = _med([f.moon_sep_deg for f in self.frames])
+        # Dominant-filter extinction (most frames).
+        ext = max(self.extinction_per_filter.values(), key=lambda x: x.n,
+                  default=None)
+        lim50 = _med(list(self.limiting_mag_p50_per_filter.values())) \
+            if self.limiting_mag_p50_per_filter else None
+        return {
+            "moon_illumination": self.moon_illumination,
+            "moon_sep_median_deg": moon_sep,
+            "extinction_k": ext.k if ext else None,
+            "extinction_k_err": ext.k_err if ext else None,
+            "zenith_transmission": (10 ** (-0.4 * ext.k)) if ext else None,
+            "clear_fraction": ext.clear_fraction if ext else None,
+            "fwhm_px_median": fwhm,
+            "fwhm_px_spread": fwhm_spread,
+            "sky_adu_median": sky_adu,
+            "sky_mag_arcsec2_median": sky_mu,
+            "limiting_mag_50_median": lim50,
+            "n_frames_photometry": self.n_frames_with_photometry,
+        }
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "night_id": self.night_id,
@@ -364,6 +425,7 @@ class NightCalibration:
             },
             "limiting_mag_p50_per_filter": self.limiting_mag_p50_per_filter,
             "limiting_mag_p90_per_filter": self.limiting_mag_p90_per_filter,
+            "conditions": self.conditions(),
             "frames": [_asdict_safe(f) for f in self.frames],
         }
 
@@ -595,6 +657,7 @@ def _fit_extinction(frames: list[FramePhoto]) -> dict[str, ExtinctionFit]:
             m0=r["m0"], m0_err=r["m0_err"],
             k=r["k"], k_err=r["k_err"],
             n=r["n"], airmass_range=r["airmass_range"],
+            clear_fraction=r["clear_fraction"],
         )
     return out
 
@@ -774,6 +837,71 @@ def load_plot_data(path: str | Path) -> dict:
     """Load a previously written plot_data.json."""
     with open(path) as f:
         return json.load(f)
+
+
+# Columns for the cross-night conditions table: (header, conditions-key, fmt).
+_NIGHTS_COLS = [
+    ("night", "night_id", "{}"),
+    ("moon%", "moon_illumination", "{:.0%}"),
+    ("moonSep°", "moon_sep_median_deg", "{:.0f}"),
+    ("k", "extinction_k", "{:.3f}"),
+    ("T_zen", "zenith_transmission", "{:.0%}"),
+    ("clear%", "clear_fraction", "{:.0%}"),
+    ("FWHM_px", "fwhm_px_median", "{:.1f}"),
+    ("FWHM_sd", "fwhm_px_spread", "{:.1f}"),
+    ("sky_ADU", "sky_adu_median", "{:.0f}"),
+    ("sky_μ", "sky_mag_arcsec2_median", "{:.1f}"),
+    ("lim50", "limiting_mag_50_median", "{:.1f}"),
+    ("nFrm", "n_frames_photometry", "{:d}"),
+]
+
+
+def summarize_nights(root: str | Path, csv_path: str | Path | None = None) -> str:
+    """Aggregate every night's conditions into one table for tracking PSF / sky /
+    extinction vs Moon phase & weather across nights. Reads each
+    ``<root>/*/calibration/night_calibration.json`` (its ``conditions`` block).
+    Returns the formatted table; optionally also writes a CSV."""
+    root = Path(root)
+    rows: list[dict] = []
+    for nc_path in sorted(root.glob("*/calibration/night_calibration.json")):
+        try:
+            with open(nc_path) as f:
+                nc = json.load(f)
+        except Exception as e:
+            logger.warning("skip %s: %s", nc_path, e)
+            continue
+        c = dict(nc.get("conditions") or {})
+        c["night_id"] = nc.get("night_id") or nc_path.parts[-3]
+        rows.append(c)
+    if not rows:
+        return f"No night_calibration.json found under {root}"
+
+    headers = [h for h, _, _ in _NIGHTS_COLS]
+    table_rows = []
+    for c in rows:
+        cells = []
+        for _h, key, fmt in _NIGHTS_COLS:
+            v = c.get(key)
+            cells.append("—" if v is None else fmt.format(v))
+        table_rows.append(cells)
+    widths = [max(len(headers[i]), *(len(r[i]) for r in table_rows))
+              for i in range(len(headers))]
+    sep = "  "
+    out = [sep.join(h.rjust(widths[i]) for i, h in enumerate(headers))]
+    out.append(sep.join("-" * widths[i] for i in range(len(headers))))
+    for r in table_rows:
+        out.append(sep.join(r[i].rjust(widths[i]) for i in range(len(headers))))
+    table = "\n".join(out)
+
+    if csv_path is not None:
+        import csv as _csv
+        with open(csv_path, "w", newline="") as f:
+            w = _csv.writer(f)
+            w.writerow([h for h, _, _ in _NIGHTS_COLS])
+            for c in rows:
+                w.writerow([c.get(key) for _h, key, _f in _NIGHTS_COLS])
+        logger.info("Wrote %s", csv_path)
+    return table
 
 
 def plot_calibration(source, output_dir: str | Path,
@@ -1776,48 +1904,72 @@ def _render_fwhm(d, meta, output_dir, plt, np) -> Path:
 def _data_sky_background(calib: NightCalibration):
     import numpy as np
 
-    pts = [(f.moon_sep_deg, f.sky_adu, f.altitude_deg) for f in calib.frames
-           if f.sky_adu is not None and f.moon_sep_deg is not None]
-    if len(pts) < 10:
+    rows = []  # (moon_sep, sky_adu, mu_or_nan, altitude)
+    for f in calib.frames:
+        if f.sky_adu is None or f.moon_sep_deg is None:
+            continue
+        mu = _sky_mu(f)
+        rows.append((f.moon_sep_deg, float(f.sky_adu),
+                     float(mu) if mu is not None else float("nan"),
+                     float(f.altitude_deg) if f.altitude_deg is not None else 0.0))
+    if len(rows) < 10:
         return None
-    sep = np.array([p[0] for p in pts])
-    sky = np.array([p[1] for p in pts])
+    sep = np.array([r[0] for r in rows])
+    adu = np.array([r[1] for r in rows])
+    mu = np.array([r[2] for r in rows])
+    has_mu = bool(np.isfinite(mu).sum() >= 10)
+    yvals = mu if has_mu else adu
     edges = np.arange(0, math.ceil(sep.max() / 10) * 10 + 10, 10)
     cx, cy, e_lo, e_hi = [], [], [], []
     for lo, hi in zip(edges[:-1], edges[1:]):
-        v = sky[(sep >= lo) & (sep < hi)]
+        v = yvals[(sep >= lo) & (sep < hi)]
+        v = v[np.isfinite(v)]
         if len(v) >= 5:
             md = float(np.median(v))
             cx.append((lo + hi) / 2)
             cy.append(md)
             e_lo.append(md - float(np.percentile(v, 16)))
             e_hi.append(float(np.percentile(v, 84)) - md)
+    mu_clean = mu[np.isfinite(mu)]
     return {
-        "sep": list(sep), "sky": list(sky),
-        "alt": [float(p[2]) if p[2] is not None else 0.0 for p in pts],
+        "sep": list(sep), "adu": list(adu),
+        "mu": [None if not math.isfinite(m) else float(m) for m in mu],
+        "alt": [r[3] for r in rows], "has_mu": has_mu,
         "binned": {"x": cx, "y": cy, "e_lo": e_lo, "e_hi": e_hi},
-        "median_sky": float(np.median(sky)),
+        "median_adu": float(np.median(adu)),
+        "median_mu": float(np.median(mu_clean)) if len(mu_clean) else None,
     }
 
 
 def _render_sky_background(d, meta, output_dir, plt, np) -> Path:
     fig, ax = plt.subplots(figsize=(10, 6))
-    cs = d["alt"]
-    sc = ax.scatter(d["sep"], d["sky"], c=cs, cmap="viridis", s=10, alpha=0.4)
+    sep = np.array(d["sep"])
+    alt = np.array(d["alt"])
+    use_mu = d["has_mu"]
+    yv = np.array([np.nan if m is None else m for m in d["mu"]]) if use_mu \
+        else np.array(d["adu"])
+    m = np.isfinite(yv)
+    sc = ax.scatter(sep[m], yv[m], c=alt[m], cmap="viridis", s=10, alpha=0.4)
     b = d["binned"]
     if b["x"]:
         ax.errorbar(b["x"], b["y"], yerr=[b["e_lo"], b["e_hi"]], fmt="o-",
                     color="black", ms=7, capsize=4, capthick=1.5, elinewidth=1.5,
                     zorder=5, label="binned median ± 16/84%")
-    if any(c > 0 for c in cs):
-        cb = plt.colorbar(sc, ax=ax)
-        cb.set_label("altitude (deg)")
+    cb = plt.colorbar(sc, ax=ax)
+    cb.set_label("altitude (deg)")
     mi = meta.get("moon_illumination")
     illum = f"Moon {100 * mi:.0f}%" if mi is not None else ""
     ax.set_xlabel("Moon separation (°)")
-    ax.set_ylabel("sky background (ADU, flat-fielded, pre-subtraction)")
-    ax.set_title(f"{meta['night_id']}: sky background vs Moon separation "
-                 f"({illum}; median {d['median_sky']:.0f} ADU)")
+    if use_mu:
+        ax.set_ylabel("sky surface brightness (mag/arcsec² — lower = brighter)")
+        ax.invert_yaxis()  # brighter sky (smaller mag) at top
+        ax.set_title(f"{meta['night_id']}: sky brightness vs Moon separation "
+                     f"({illum}; median {d['median_mu']:.1f} mag/arcsec², "
+                     f"{d['median_adu']:.0f} ADU)")
+    else:
+        ax.set_ylabel("sky background (ADU, flat-fielded, pre-subtraction)")
+        ax.set_title(f"{meta['night_id']}: sky background vs Moon separation "
+                     f"({illum}; median {d['median_adu']:.0f} ADU)")
     ax.grid(True, alpha=0.3)
     ax.legend(loc="best", fontsize=9)
     return _save(fig, output_dir / "sky_background_vs_moon.png")

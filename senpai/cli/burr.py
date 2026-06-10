@@ -558,6 +558,15 @@ def cmd_flats(args: argparse.Namespace) -> int:
 # --- sub-command: calibrate ---------------------------------------------------
 
 
+def cmd_nights_summary(args: argparse.Namespace) -> int:
+    """Cross-night conditions table (PSF / sky / extinction vs Moon & weather)."""
+    from senpai.engine.observability.calibration import summarize_nights
+
+    table = summarize_nights(args.root, csv_path=args.csv)
+    print(table)
+    return 0
+
+
 def cmd_calibrate(args: argparse.Namespace) -> int:
     """Aggregate per-batch SenpaiRun JSONs into a per-night calibration."""
 
@@ -924,6 +933,16 @@ def build_parser() -> argparse.ArgumentParser:
              "<output>/plot_data.json instead of the batch JSONs.",
     )
     p_cal.set_defaults(func=cmd_calibrate)
+
+    p_ns = sub.add_parser(
+        "nights-summary",
+        help="Cross-night conditions table (PSF/sky/extinction vs Moon & weather).")
+    p_ns.add_argument(
+        "root",
+        help="Processed root containing <sensor>_<night>/calibration/"
+             "night_calibration.json dirs (e.g. .../_full8).")
+    p_ns.add_argument("--csv", default=None, help="Also write the table as CSV.")
+    p_ns.set_defaults(func=cmd_nights_summary)
 
     p_live = sub.add_parser("live", help="(stub) Watch a sensor data dir live.")
     p_live.add_argument("data_dir", help="Sensor data dir, e.g. /burr/Hornet/.")
