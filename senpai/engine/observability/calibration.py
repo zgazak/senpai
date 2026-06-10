@@ -777,272 +777,9 @@ def _render_legacy(
     import matplotlib.pyplot as plt
     import numpy as np
 
-    # 1) Extinction curve: per-star ZP offset (m_cat − m_inst) vs airmass —
-    #    gray cloud + airmass-binned medians + linear fit whose slope is −k.
-    #    Sidereal frames only (rate-track photometry is unreliable for ZP).
-    #    Runs predating stars_zp_offset retention have no per-star offsets;
-    #    those fall back to one point per frame (the frame ZP) with the
-    #    per-filter Bouguer fit overlaid.
-    # Mirror the frame-ZP selection (zp_min_snr, default 20): below it,
-    # aperture fluxes at faint catalog positions are contaminated upward and
-    # drag the offsets high. Normalize by exposure so offsets match the frame
-    # ZP convention (m + 2.5·log10(flux/texp)) — stars_zp_offset itself is
-    # m_cat − m_inst with m_inst = −2.5·log10(flux), no texp term.
-    ext_min_snr = 20.0
-    star_ext: list[tuple[float, float]] = []  # (airmass, per-star ZP)
-    for f in _zp_frames(calib.frames):
-        if f.airmass is None or not f.stars_zp_offset or not f.exposure_time:
-            continue
-        texp_term = 2.5 * math.log10(f.exposure_time)
-        star_ext.extend(
-            (f.airmass, off - texp_term)
-            for m, off, snr, iso in zip(f.stars_mag, f.stars_zp_offset,
-                                        f.stars_snr, _isolated_flags(f))
-            if off is not None and snr >= ext_min_snr and iso
-            and _snr_consistent(snr, m, f)
-        )
-    fig, ax = None, None
-    if len(star_ext) >= 10:
-        fig, ax = plt.subplots(figsize=(10, 7))
-        airmasses = np.array([p[0] for p in star_ext])
-        offsets = np.array([p[1] for p in star_ext])
-        # Clip gross outliers (mismatched/blended stars) before plotting/fit.
-        keep = np.abs(offsets - offsets.mean()) <= 3 * offsets.std()
-        airmasses, offsets = airmasses[keep], offsets[keep]
-        ax.scatter(airmasses, offsets, alpha=0.3, s=10, color="lightgray",
-                   label="Individual stars")
-        bin_edges = np.arange(airmasses.min(), airmasses.max() + 0.2, 0.2)
-        centers, medians, err_lo, err_hi = [], [], [], []
-        for lo, hi in zip(bin_edges[:-1], bin_edges[1:]):
-            in_bin = offsets[(airmasses >= lo) & (airmasses < hi)]
-            if len(in_bin) < 3:
-                continue
-            med = float(np.median(in_bin))
-            centers.append((lo + hi) / 2)
-            medians.append(med)
-            err_lo.append(med - float(np.percentile(in_bin, 16)))
-            err_hi.append(float(np.percentile(in_bin, 84)) - med)
-        if centers:
-            ax.errorbar(
-                centers, medians, yerr=[err_lo, err_hi], fmt="o",
-                color="black", markersize=7, capsize=4, capthick=1.5,
-                elinewidth=1.5, alpha=0.85,
-                label="Binned data (median ± 1σ percentiles)",
-            )
-        # offset = m0 − k·X  →  fitted slope = −k. Fit the binned MEDIANS, not
-        # OLS-on-all-stars: the per-star cloud is left-skewed (faint-star noise
-        # + flux underestimates tail downward), so a least-squares fit on every
-        # star sits below the medians. The skew is ~airmass-independent so the
-        # slope (k) barely moves, but the median fit makes the red line track
-        # the black points. Falls back to per-star OLS if too few bins.
-        if len(centers) >= 2:
-            slope, intercept = np.polyfit(centers, medians, 1)
-            fit_note = "median-binned fit"
-        else:
-            slope, intercept = np.polyfit(airmasses, offsets, 1)
-            fit_note = "per-star fit"
-        line_x = np.linspace(airmasses.min(), airmasses.max(), 50)
-        ax.plot(line_x, slope * line_x + intercept, "r-", linewidth=2,
-                alpha=0.8,
-                label=f"Extinction: k={-slope:.3f} mag/airmass ({fit_note})")
-        ax.set_ylabel(r"per-star ZP (m$_{cat}$ + 2.5·log$_{10}$(flux/t$_{exp}$)) [mag]")
-        ax.set_title(f"{calib.night_id}: extinction curve ({len(airmasses)} "
-                     f"isolated stars, sidereal, SNR≥{ext_min_snr:.0f})")
-    else:
-        # Frame-level fallback: ZP per frame, per-filter Bouguer fit overlay.
-        zp_pts = [(f.airmass, f.zero_point, f.filter_name or "unknown")
-                  for f in _zp_frames(calib.frames)
-                  if f.airmass is not None and f.zero_point is not None]
-        if zp_pts:
-            fig, ax = plt.subplots(figsize=(10, 7))
-            filters = sorted({p[2] for p in zp_pts})
-            cmap = plt.cm.viridis(np.linspace(0, 0.85, max(len(filters), 1)))
-            for color, filt in zip(cmap, filters):
-                xs = [p[0] for p in zp_pts if p[2] == filt]
-                ys = [p[1] for p in zp_pts if p[2] == filt]
-                ax.scatter(xs, ys, label=f"{filt} (n={len(xs)})", s=12,
-                           alpha=0.6, color=color)
-                fit = calib.extinction_per_filter.get(filt)
-                if fit:
-                    line_x = np.linspace(min(xs), max(xs), 50)
-                    ax.plot(
-                        line_x, fit.m0 - fit.k * line_x, color=color,
-                        linewidth=1.5,
-                        label=f"  k={fit.k:.3f}±{fit.k_err:.3f}, "
-                              f"m0={fit.m0:.3f}±{fit.m0_err:.3f}",
-                    )
-            ax.set_ylabel("zero point (instrumental → catalog mag)")
-            ax.set_title(f"{calib.night_id}: Bouguer extinction (per-frame)")
-    if fig is not None:
-        ax.set_xlabel("Airmass")
-        ax.grid(True, alpha=0.3)
-        ax.legend(loc="best", fontsize=9)
-        # Twin top axis: airmass → altitude (alt = arcsin(1/X)).
-        ax2 = ax.twiny()
-        ticks = np.array([t for t in ax.get_xticks() if t >= 1.0])
-        if len(ticks):
-            ax2.set_xticks(ticks)
-            ax2.set_xticklabels(
-                [f"{math.degrees(math.asin(1.0 / t)):.0f}°" for t in ticks])
-        ax2.set_xlim(ax.get_xlim())
-        ax2.set_xlabel("Altitude")
-        paths.append(_save(fig, output_dir / "extinction_curve.png"))
-
-    # 3) Az/Alt coverage polar plot
-    aa = [(f.azimuth_deg, f.altitude_deg, f.timestamp)
-          for f in calib.frames
-          if f.azimuth_deg is not None and f.altitude_deg is not None]
-    if aa:
-        fig = plt.figure(figsize=(7, 7))
-        ax = fig.add_subplot(111, projection="polar")
-        ax.set_theta_zero_location("N")
-        ax.set_theta_direction(-1)
-        ts0 = min(t for _, _, t in aa if t is not None) if any(t for _, _, t in aa) else None
-        if ts0 is not None:
-            colors = [
-                (t - ts0).total_seconds() if t is not None else 0
-                for _, _, t in aa
-            ]
-        else:
-            colors = [0] * len(aa)
-        thetas = [math.radians(p[0]) for p in aa]
-        rs = [90 - p[1] for p in aa]  # zenith distance — center = zenith
-        sc = ax.scatter(thetas, rs, c=colors, s=12, cmap="plasma", alpha=0.7)
-        ax.set_ylim(0, 90)
-        ax.set_yticks([15, 30, 45, 60, 75])
-        ax.set_yticklabels([f"{90-r}°" for r in [15, 30, 45, 60, 75]])
-        ax.set_title(f"{calib.night_id}: Az/Alt coverage  (n={len(aa)})", pad=20)
-        if ts0 is not None:
-            cb = plt.colorbar(sc, ax=ax, pad=0.1, shrink=0.7)
-            cb.set_label("seconds since first frame")
-        paths.append(_save(fig, output_dir / "alt_az_coverage.png"))
-
-    # 4) ZP drift over the night (sidereal frames only)
-    drift = [(f.timestamp, f.zero_point, f.filter_name or "unknown")
-             for f in _zp_frames(calib.frames)
-             if f.timestamp is not None and f.zero_point is not None]
-    if drift:
-        from datetime import timedelta
-        fig, ax = plt.subplots(figsize=(10, 5))
-        filters = sorted({d[2] for d in drift})
-        BIN_SECONDS = 1200.0  # 20-minute time bins
-        for filt in filters:
-            pts = sorted((d[0], d[1]) for d in drift if d[2] == filt)
-            xs = [p[0] for p in pts]
-            ys = np.array([p[1] for p in pts])
-            ax.scatter(xs, ys, label=f"{filt} (n={len(xs)})", s=10, alpha=0.4)
-            # Time-binned median ± 16/84 percentiles, same style as the
-            # extinction curve. The asymmetric bars widen downward as patchy
-            # cloud rolls in (transparency loss drops ZP at fixed airmass),
-            # making the conditions trend quantitative rather than eyeballed.
-            t0 = xs[0]
-            secs = np.array([(x - t0).total_seconds() for x in xs])
-            edges = np.arange(0.0, secs.max() + BIN_SECONDS, BIN_SECONDS)
-            cx, cy, e_lo, e_hi = [], [], [], []
-            for lo, hi in zip(edges[:-1], edges[1:]):
-                in_bin = ys[(secs >= lo) & (secs < hi)]
-                if len(in_bin) < 3:
-                    continue
-                med = float(np.median(in_bin))
-                cx.append(t0 + timedelta(seconds=(lo + hi) / 2))
-                cy.append(med)
-                e_lo.append(med - float(np.percentile(in_bin, 16)))
-                e_hi.append(float(np.percentile(in_bin, 84)) - med)
-            if cx:
-                lbl = ("binned (median ± 16/84%)" if len(filters) == 1
-                       else f"{filt} binned")
-                ax.errorbar(
-                    cx, cy, yerr=[e_lo, e_hi], fmt="o", color="black",
-                    markersize=6, capsize=4, capthick=1.5, elinewidth=1.5,
-                    alpha=0.85, zorder=5, label=lbl,
-                )
-        ax.set_xlabel("UTC time")
-        ax.set_ylabel("zero point")
-        ax.set_title(f"{calib.night_id}: zero point drift")
-        ax.legend(loc="best", fontsize=9)
-        ax.grid(True, alpha=0.3)
-        fig.autofmt_xdate()
-        paths.append(_save(fig, output_dir / "zp_drift.png"))
-
-    # 6) Search rate vs magnitude, per STAR (sidereal frames only — rate-track
-    #    aperture photometry is unreliable). For each measured star, scale its
-    #    observed SNR to the exposure needed for SNR=6 (background-limited:
-    #    SNR ∝ √t → t_req = t·(6/snr)²), clamp at a minimum exposure, add
-    #    readout, and convert to sky area covered per hour at that cadence.
-    #    Bright stars hit the exposure floor → the flat ceiling on the left;
-    #    the roll-off to the right is the depth/coverage trade-off.
-    target_snr = 6.0
-    min_exposure_s = 0.1
-    readout_s = 1.0
-    # Stars below this measured SNR are forced-aperture noise at catalog
-    # positions (the arrays retain every Gaia position with snr > 0, far past
-    # the detection limit) — Eddington-biased, and the (6/snr)² extrapolation
-    # is meaningless there. Matches limiting_snr (3): with non-detections
-    # zero-injected below, survivor bias no longer needs a conservative
-    # floor, and 3≤SNR<5 stars fill the gap between the detected cloud and
-    # the zero band.
+    # Forced-photometry floor shared by the SNR/Moon blocks below (was defined
+    # in the now-migrated search-rate block).
     min_meas_snr = 3.0
-    star_pts: list[tuple[float, float]] = []  # (catalog mag, deg²/hr at SNR=6)
-    lim50s: list[float] = []
-    for f in _zp_frames(calib.frames):
-        if not f.exposure_time or not f.fov_sq_deg or not f.stars_mag:
-            continue
-        if f.limiting_magnitude_50 is not None:
-            lim50s.append(f.limiting_magnitude_50)
-        for m, s, iso in zip(f.stars_mag, f.stars_snr, _isolated_flags(f)):
-            if not iso:
-                continue  # blended: the measurement belongs to the neighbor
-            if s < min_meas_snr:
-                # Non-detection on THIS frame: contributes zero search rate,
-                # so faint bins honestly read "mostly undetectable" (deep
-                # frames pull the median up) instead of showing only the
-                # surviving measurements — high, and wildly variable.
-                star_pts.append((m, 0.0))
-            elif _snr_consistent(s, m, f):
-                t_req = max(f.exposure_time * (target_snr / s) ** 2,
-                            min_exposure_s)
-                star_pts.append((m, f.fov_sq_deg / (t_req + readout_s) * 3600.0))
-            # else: flux inconsistent with catalog mag (wings/variables/bad
-            # cross-match) — not a measurement of this star; drop entirely.
-    if star_pts:
-        fig, ax = plt.subplots(figsize=(10, 7))
-        mags = np.array([p[0] for p in star_pts])
-        rates = np.array([p[1] for p in star_pts])
-        ax.scatter(mags, rates, alpha=0.3, s=10, color="lightgray",
-                   label="Individual stars")
-        # Binned medians with asymmetric 16/84-percentile error bars.
-        bin_width = 0.5
-        bin_edges = np.arange(math.floor(mags.min() / bin_width) * bin_width,
-                              mags.max() + bin_width, bin_width)
-        centers, medians, err_lo, err_hi = [], [], [], []
-        for lo, hi in zip(bin_edges[:-1], bin_edges[1:]):
-            in_bin = rates[(mags >= lo) & (mags < hi)]
-            if len(in_bin) < 5:
-                continue
-            med = float(np.median(in_bin))
-            centers.append((lo + hi) / 2)
-            medians.append(med)
-            err_lo.append(med - float(np.percentile(in_bin, 16)))
-            err_hi.append(float(np.percentile(in_bin, 84)) - med)
-        if centers:
-            ax.errorbar(
-                centers, medians, yerr=[err_lo, err_hi], fmt="o",
-                color="black", markersize=7, capsize=4, capthick=1.5,
-                elinewidth=1.5, alpha=0.85,
-                label="Binned data (median ± 1σ percentiles)",
-            )
-        if lim50s:
-            med_lim = float(np.median(lim50s))
-            ax.axvline(med_lim, color="firebrick", linestyle="--", linewidth=1.5,
-                       alpha=0.8, label=f"median lim. mag (50%) = {med_lim:.1f}")
-        ax.set_xlabel("Apparent Magnitude (Catalog)")
-        ax.set_ylabel(f"Search Rate (deg²/hour at SNR={target_snr:.0f})")
-        ax.set_title(f"{calib.night_id}: search rate vs magnitude "
-                     f"({len(star_pts)} isolated stars, sidereal, "
-                     f"SNR≥{min_meas_snr:.0f})")
-        ax.grid(True, alpha=0.3)
-        ax.legend(loc="lower left", fontsize=9)
-        paths.append(_save(fig, output_dir / "search_rate.png"))
 
     # 8) SNR vs exposure time, one errorbar series per 1-mag bin, FACETED BY
     #    TASK. Pooling tasks makes this plot zigzag and is physically
@@ -1654,10 +1391,296 @@ def _render_detection_rate_vs_altitude(d, meta, output_dir, plt, np) -> Path:
     return _save(fig, output_dir / "detection_rate_vs_altitude.png")
 
 
+def _data_extinction_curve(calib: NightCalibration):
+    import numpy as np
+
+    ext_min_snr = 20.0
+    star_ext = []  # (airmass, per-star ZP)
+    for f in _zp_frames(calib.frames):
+        if f.airmass is None or not f.stars_zp_offset or not f.exposure_time:
+            continue
+        texp_term = 2.5 * math.log10(f.exposure_time)
+        star_ext.extend(
+            (f.airmass, off - texp_term)
+            for m, off, snr, iso in zip(f.stars_mag, f.stars_zp_offset,
+                                        f.stars_snr, _isolated_flags(f))
+            if off is not None and snr >= ext_min_snr and iso
+            and _snr_consistent(snr, m, f)
+        )
+    if len(star_ext) >= 10:
+        airmasses = np.array([p[0] for p in star_ext])
+        offsets = np.array([p[1] for p in star_ext])
+        keep = np.abs(offsets - offsets.mean()) <= 3 * offsets.std()
+        airmasses, offsets = airmasses[keep], offsets[keep]
+        bin_edges = np.arange(airmasses.min(), airmasses.max() + 0.2, 0.2)
+        centers, medians, err_lo, err_hi = [], [], [], []
+        for lo, hi in zip(bin_edges[:-1], bin_edges[1:]):
+            in_bin = offsets[(airmasses >= lo) & (airmasses < hi)]
+            if len(in_bin) < 3:
+                continue
+            med = float(np.median(in_bin))
+            centers.append((lo + hi) / 2)
+            medians.append(med)
+            err_lo.append(med - float(np.percentile(in_bin, 16)))
+            err_hi.append(float(np.percentile(in_bin, 84)) - med)
+        if len(centers) >= 2:
+            slope, intercept = np.polyfit(centers, medians, 1)
+            fit_note = "median-binned fit"
+        else:
+            slope, intercept = np.polyfit(airmasses, offsets, 1)
+            fit_note = "per-star fit"
+        return {
+            "mode": "per_star",
+            "airmass": airmasses, "offset": offsets,
+            "binned": {"x": centers, "y": medians,
+                       "err_lo": err_lo, "err_hi": err_hi},
+            "fit": {"slope": float(slope), "intercept": float(intercept),
+                    "note": fit_note},
+            "n_stars": int(len(airmasses)), "ext_min_snr": ext_min_snr,
+        }
+    zp_pts = [(f.airmass, f.zero_point, f.filter_name or "unknown")
+              for f in _zp_frames(calib.frames)
+              if f.airmass is not None and f.zero_point is not None]
+    if not zp_pts:
+        return None
+    per_filter = {}
+    for filt in sorted({p[2] for p in zp_pts}):
+        xs = [p[0] for p in zp_pts if p[2] == filt]
+        ys = [p[1] for p in zp_pts if p[2] == filt]
+        fit = calib.extinction_per_filter.get(filt)
+        per_filter[filt] = {
+            "airmass": xs, "zp": ys,
+            "fit": ({"k": fit.k, "k_err": fit.k_err,
+                     "m0": fit.m0, "m0_err": fit.m0_err} if fit else None),
+        }
+    return {"mode": "frame", "per_filter": per_filter}
+
+
+def _render_extinction_curve(d, meta, output_dir, plt, np) -> Path:
+    fig, ax = plt.subplots(figsize=(10, 7))
+    if d["mode"] == "per_star":
+        airmasses = np.array(d["airmass"])
+        offsets = np.array(d["offset"])
+        ax.scatter(airmasses, offsets, alpha=0.3, s=10, color="lightgray",
+                   label="Individual stars")
+        b = d["binned"]
+        if b["x"]:
+            ax.errorbar(b["x"], b["y"], yerr=[b["err_lo"], b["err_hi"]], fmt="o",
+                        color="black", markersize=7, capsize=4, capthick=1.5,
+                        elinewidth=1.5, alpha=0.85,
+                        label="Binned data (median ± 1σ percentiles)")
+        slope, intercept = d["fit"]["slope"], d["fit"]["intercept"]
+        line_x = np.linspace(airmasses.min(), airmasses.max(), 50)
+        ax.plot(line_x, slope * line_x + intercept, "r-", linewidth=2, alpha=0.8,
+                label=f"Extinction: k={-slope:.3f} mag/airmass "
+                      f"({d['fit']['note']})")
+        ax.set_ylabel(r"per-star ZP (m$_{cat}$ + 2.5·log$_{10}$(flux/t$_{exp}$)) [mag]")
+        ax.set_title(f"{meta['night_id']}: extinction curve ({d['n_stars']} "
+                     f"isolated stars, sidereal, SNR≥{d['ext_min_snr']:.0f})")
+    else:
+        per_filter = d["per_filter"]
+        filters = sorted(per_filter)
+        cmap = plt.cm.viridis(np.linspace(0, 0.85, max(len(filters), 1)))
+        for color, filt in zip(cmap, filters):
+            s = per_filter[filt]
+            xs, ys = s["airmass"], s["zp"]
+            ax.scatter(xs, ys, label=f"{filt} (n={len(xs)})", s=12, alpha=0.6,
+                       color=color)
+            fit = s["fit"]
+            if fit:
+                line_x = np.linspace(min(xs), max(xs), 50)
+                ax.plot(line_x, fit["m0"] - fit["k"] * line_x, color=color,
+                        linewidth=1.5,
+                        label=f"  k={fit['k']:.3f}±{fit['k_err']:.3f}, "
+                              f"m0={fit['m0']:.3f}±{fit['m0_err']:.3f}")
+        ax.set_ylabel("zero point (instrumental → catalog mag)")
+        ax.set_title(f"{meta['night_id']}: Bouguer extinction (per-frame)")
+    ax.set_xlabel("Airmass")
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="best", fontsize=9)
+    ax2 = ax.twiny()
+    ticks = np.array([t for t in ax.get_xticks() if t >= 1.0])
+    if len(ticks):
+        ax2.set_xticks(ticks)
+        ax2.set_xticklabels(
+            [f"{math.degrees(math.asin(1.0 / t)):.0f}°" for t in ticks])
+    ax2.set_xlim(ax.get_xlim())
+    ax2.set_xlabel("Altitude")
+    return _save(fig, output_dir / "extinction_curve.png")
+
+
+def _data_alt_az_coverage(calib: NightCalibration):
+    aa = [(f.azimuth_deg, f.altitude_deg, f.timestamp) for f in calib.frames
+          if f.azimuth_deg is not None and f.altitude_deg is not None]
+    if not aa:
+        return None
+    ts = [t for _, _, t in aa if t is not None]
+    ts0 = min(ts) if ts else None
+    colors = [(t - ts0).total_seconds() if (ts0 is not None and t is not None)
+              else 0 for _, _, t in aa]
+    return {
+        "thetas": [math.radians(p[0]) for p in aa],
+        "rs": [90 - p[1] for p in aa],
+        "colors": colors, "has_time": ts0 is not None, "n": len(aa),
+    }
+
+
+def _render_alt_az_coverage(d, meta, output_dir, plt, np) -> Path:
+    fig = plt.figure(figsize=(7, 7))
+    ax = fig.add_subplot(111, projection="polar")
+    ax.set_theta_zero_location("N")
+    ax.set_theta_direction(-1)
+    sc = ax.scatter(d["thetas"], d["rs"], c=d["colors"], s=12, cmap="plasma",
+                    alpha=0.7)
+    ax.set_ylim(0, 90)
+    ax.set_yticks([15, 30, 45, 60, 75])
+    ax.set_yticklabels([f"{90 - r}°" for r in [15, 30, 45, 60, 75]])
+    ax.set_title(f"{meta['night_id']}: Az/Alt coverage  (n={d['n']})", pad=20)
+    if d["has_time"]:
+        cb = plt.colorbar(sc, ax=ax, pad=0.1, shrink=0.7)
+        cb.set_label("seconds since first frame")
+    return _save(fig, output_dir / "alt_az_coverage.png")
+
+
+def _data_zp_drift(calib: NightCalibration):
+    import numpy as np
+    from datetime import timedelta
+
+    drift = [(f.timestamp, f.zero_point, f.filter_name or "unknown")
+             for f in _zp_frames(calib.frames)
+             if f.timestamp is not None and f.zero_point is not None]
+    if not drift:
+        return None
+    BIN_SECONDS = 1200.0
+    per_filter = {}
+    for filt in sorted({d[2] for d in drift}):
+        pts = sorted((d[0], d[1]) for d in drift if d[2] == filt)
+        xs = [p[0] for p in pts]
+        ys = np.array([p[1] for p in pts])
+        t0 = xs[0]
+        secs = np.array([(x - t0).total_seconds() for x in xs])
+        edges = np.arange(0.0, secs.max() + BIN_SECONDS, BIN_SECONDS)
+        cx, cy, e_lo, e_hi = [], [], [], []
+        for lo, hi in zip(edges[:-1], edges[1:]):
+            in_bin = ys[(secs >= lo) & (secs < hi)]
+            if len(in_bin) < 3:
+                continue
+            med = float(np.median(in_bin))
+            cx.append((t0 + timedelta(seconds=(lo + hi) / 2)).isoformat())
+            cy.append(med)
+            e_lo.append(med - float(np.percentile(in_bin, 16)))
+            e_hi.append(float(np.percentile(in_bin, 84)) - med)
+        per_filter[filt] = {
+            "scatter_t": [x.isoformat() for x in xs],
+            "scatter_zp": [float(y) for y in ys],
+            "binned_t": cx, "binned_zp": cy, "err_lo": e_lo, "err_hi": e_hi,
+        }
+    return {"per_filter": per_filter, "n_filters": len(per_filter)}
+
+
+def _render_zp_drift(d, meta, output_dir, plt, np) -> Path:
+    from datetime import datetime as _dt
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    for filt in sorted(d["per_filter"]):
+        s = d["per_filter"][filt]
+        xs = [_dt.fromisoformat(t) for t in s["scatter_t"]]
+        ax.scatter(xs, s["scatter_zp"], label=f"{filt} (n={len(xs)})", s=10,
+                   alpha=0.4)
+        if s["binned_t"]:
+            cx = [_dt.fromisoformat(t) for t in s["binned_t"]]
+            lbl = ("binned (median ± 16/84%)" if d["n_filters"] == 1
+                   else f"{filt} binned")
+            ax.errorbar(cx, s["binned_zp"], yerr=[s["err_lo"], s["err_hi"]],
+                        fmt="o", color="black", markersize=6, capsize=4,
+                        capthick=1.5, elinewidth=1.5, alpha=0.85, zorder=5,
+                        label=lbl)
+    ax.set_xlabel("UTC time")
+    ax.set_ylabel("zero point")
+    ax.set_title(f"{meta['night_id']}: zero point drift")
+    ax.legend(loc="best", fontsize=9)
+    ax.grid(True, alpha=0.3)
+    fig.autofmt_xdate()
+    return _save(fig, output_dir / "zp_drift.png")
+
+
+def _data_search_rate(calib: NightCalibration):
+    import numpy as np
+
+    target_snr, min_exposure_s, readout_s, min_meas_snr = 6.0, 0.1, 1.0, 3.0
+    star_pts, lim50s = [], []
+    for f in _zp_frames(calib.frames):
+        if not f.exposure_time or not f.fov_sq_deg or not f.stars_mag:
+            continue
+        if f.limiting_magnitude_50 is not None:
+            lim50s.append(f.limiting_magnitude_50)
+        for m, s, iso in zip(f.stars_mag, f.stars_snr, _isolated_flags(f)):
+            if not iso:
+                continue
+            if s < min_meas_snr:
+                star_pts.append((m, 0.0))
+            elif _snr_consistent(s, m, f):
+                t_req = max(f.exposure_time * (target_snr / s) ** 2,
+                            min_exposure_s)
+                star_pts.append((m, f.fov_sq_deg / (t_req + readout_s) * 3600.0))
+    if not star_pts:
+        return None
+    mags = np.array([p[0] for p in star_pts])
+    rates = np.array([p[1] for p in star_pts])
+    bin_width = 0.5
+    bin_edges = np.arange(math.floor(mags.min() / bin_width) * bin_width,
+                          mags.max() + bin_width, bin_width)
+    centers, medians, err_lo, err_hi = [], [], [], []
+    for lo, hi in zip(bin_edges[:-1], bin_edges[1:]):
+        in_bin = rates[(mags >= lo) & (mags < hi)]
+        if len(in_bin) < 5:
+            continue
+        med = float(np.median(in_bin))
+        centers.append((lo + hi) / 2)
+        medians.append(med)
+        err_lo.append(med - float(np.percentile(in_bin, 16)))
+        err_hi.append(float(np.percentile(in_bin, 84)) - med)
+    return {
+        "mags": mags, "rates": rates,
+        "binned": {"x": centers, "y": medians, "err_lo": err_lo, "err_hi": err_hi},
+        "median_lim50": float(np.median(lim50s)) if lim50s else None,
+        "n_stars": len(star_pts), "target_snr": target_snr,
+        "min_meas_snr": min_meas_snr,
+    }
+
+
+def _render_search_rate(d, meta, output_dir, plt, np) -> Path:
+    fig, ax = plt.subplots(figsize=(10, 7))
+    ax.scatter(d["mags"], d["rates"], alpha=0.3, s=10, color="lightgray",
+               label="Individual stars")
+    b = d["binned"]
+    if b["x"]:
+        ax.errorbar(b["x"], b["y"], yerr=[b["err_lo"], b["err_hi"]], fmt="o",
+                    color="black", markersize=7, capsize=4, capthick=1.5,
+                    elinewidth=1.5, alpha=0.85,
+                    label="Binned data (median ± 1σ percentiles)")
+    if d["median_lim50"] is not None:
+        ax.axvline(d["median_lim50"], color="firebrick", linestyle="--",
+                   linewidth=1.5, alpha=0.8,
+                   label=f"median lim. mag (50%) = {d['median_lim50']:.1f}")
+    ax.set_xlabel("Apparent Magnitude (Catalog)")
+    ax.set_ylabel(f"Search Rate (deg²/hour at SNR={d['target_snr']:.0f})")
+    ax.set_title(f"{meta['night_id']}: search rate vs magnitude "
+                 f"({d['n_stars']} isolated stars, sidereal, "
+                 f"SNR≥{d['min_meas_snr']:.0f})")
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="lower left", fontsize=9)
+    return _save(fig, output_dir / "search_rate.png")
+
+
 _PLOT_BUILDERS.update({
+    "extinction_curve": (_data_extinction_curve, _render_extinction_curve),
     "limiting_magnitude_hist": (
         _data_limiting_magnitude_hist, _render_limiting_magnitude_hist),
+    "alt_az_coverage": (_data_alt_az_coverage, _render_alt_az_coverage),
+    "zp_drift": (_data_zp_drift, _render_zp_drift),
     "depth_vs_exposure": (_data_depth_vs_exposure, _render_depth_vs_exposure),
+    "search_rate": (_data_search_rate, _render_search_rate),
     "detection_rate_vs_altitude": (
         _data_detection_rate_vs_altitude, _render_detection_rate_vs_altitude),
 })
