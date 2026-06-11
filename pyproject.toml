@@ -1,6 +1,6 @@
 [project]
 name = "astro-senpai"
-version = "2.3.1"
+version = "2.3.2"
 description = "SENPAI is a software package for the analysis of astronomical images."
 authors = [
     { name="Zach Gazak", email="jzg@alum.mit.edu" }
