@@ -92,6 +92,17 @@ def refine_correlation_shift_by_global_shift(
             "streak model", rate_frame_source.index,
         )
         return shift
+    starfield = rate_frame_source.starfield
+    if (starfield is None or not starfield.catalog_stars
+            or not starfield.astrometric_fit_stars):
+        # No catalog/astrometric stars on the source frame (failed catalog
+        # query or WCS) — the global-shift refinement has nothing to anchor
+        # to; keep the unrefined CC shift.
+        logger.warning(
+            "Skipping correlation-shift refinement: source frame %s has no "
+            "catalog/astrometric stars", rate_frame_source.index,
+        )
+        return shift
     kernel = rectangle_pyramoid(
         rate_frame_source.streak.pixel_length,
         rate_frame_source.streak.sine_angle,
