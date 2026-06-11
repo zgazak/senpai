@@ -30,7 +30,10 @@ def shift_filter_subpx(filter, pix_shift):
     return shifted
 
 
-@functools.lru_cache(maxsize=32)
+# maxsize must hold a full seed-search sweep (~19 kernels) plus the
+# per-frame detection/mask kernels across concurrent track rates; at 32 the
+# seed sweep alone evicted itself every frame and rebuilt ~1.7s of kernels.
+@functools.lru_cache(maxsize=256)
 def rectangle_pyramoid(
     length: float,
     sinx: float,

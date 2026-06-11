@@ -353,3 +353,140 @@ def test_satellite_extract_assigns_no_radec_without_wcs():
         assert det.ra is None
         assert det.dec is None
         assert det.pixel_fwhm is not None and det.pixel_fwhm > 0
+
+
+# ---------------------------------------------------------------------------
+# Large-format paths: binned second pass + FWHM-crop fallback
+#
+# On large frames the second detection pass runs on a 2x2-binned frame when
+# the PSF is fat enough (FWHM >= 6 px) and accepted centroids are re-measured
+# at full resolution; pass 1 (FWHM estimation) runs on a central crop with a
+# full-frame fallback. These tests pin both the routing (which branch ran)
+# and the contract that matters downstream: sub-pixel centroid accuracy.
+# ---------------------------------------------------------------------------
+def _large_field(
+    sigma: float,
+    shape: tuple[int, int] = (2304, 2304),
+    margin: int = 150,
+    spacing: int = 250,
+    flux: float = 60000.0,
+    seed: int = 42,
+) -> tuple[np.ndarray, list[tuple[float, float]]]:
+    """A large synthetic field with sub-pixel jittered star positions."""
+    rng = np.random.default_rng(seed)
+    h, w = shape
+    truth = []
+    image = np.full(shape, 100.0) + rng.normal(0.0, 5.0, shape)
+    for gy in range(margin, h - margin, spacing):
+        for gx in range(margin, w - margin, spacing):
+            x = gx + float(rng.uniform(-0.5, 0.5))
+            y = gy + float(rng.uniform(-0.5, 0.5))
+            _add_gaussian(image, x, y, flux, sigma)
+            truth.append((x, y))
+    return image, truth
+
+
+def _centroid_rms(detected, truth, tol=1.5):
+    """(n_matched, rms residual) of truth stars matched by a detection."""
+    residuals = []
+    for tx, ty in truth:
+        best = None
+        for dx, dy in detected:
+            d2 = (dx - tx) ** 2 + (dy - ty) ** 2
+            if d2 <= tol**2 and (best is None or d2 < best):
+                best = d2
+        if best is not None:
+            residuals.append(best)
+    if not residuals:
+        return 0, np.inf
+    return len(residuals), float(np.sqrt(np.mean(residuals)))
+
+
+def _track_refiner_calls(monkeypatch):
+    """Record invocations of the full-res centroid refiner (binned path only)."""
+    import senpai.engine.detection.point.sidereal as sid
+
+    calls = []
+    original = sid._refine_centroid_full_res
+
+    def wrapper(*args, **kwargs):
+        calls.append(1)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(sid, "_refine_centroid_full_res", wrapper)
+    return calls
+
+
+def test_binned_pass2_runs_and_keeps_subpixel_accuracy(monkeypatch):
+    sigma = 3.5  # FWHM ~8.2 px -> binned branch
+    image, truth = _large_field(sigma)
+    refiner_calls = _track_refiner_calls(monkeypatch)
+
+    starlist, fwhm = extract_point_sources(
+        _processed_image(image), max_detections=len(truth)
+    )
+
+    assert refiner_calls, "fat-PSF large frame must take the binned pass-2 path"
+    assert fwhm == pytest.approx(SIGMA_TO_FWHM * sigma, abs=1.0)
+    detected = [(d.x, d.y) for d in starlist.detections]
+    n_matched, rms = _centroid_rms(detected, truth)
+    assert n_matched >= 0.95 * len(truth)
+    # The contract that matters for astrometry: binning must not cost
+    # sub-pixel accuracy (full-res refinement recovers it).
+    assert rms < 0.15
+
+
+def test_small_fwhm_large_frame_stays_unbinned(monkeypatch):
+    sigma = 1.7  # FWHM ~4.0 px -> binning would undersample; must not bin
+    image, truth = _large_field(sigma)
+    refiner_calls = _track_refiner_calls(monkeypatch)
+
+    starlist, fwhm = extract_point_sources(
+        _processed_image(image), max_detections=len(truth)
+    )
+
+    assert not refiner_calls, "well-sampled PSF must use the full-res path"
+    assert fwhm == pytest.approx(SIGMA_TO_FWHM * sigma, abs=1.0)
+    detected = [(d.x, d.y) for d in starlist.detections]
+    n_matched, rms = _centroid_rms(detected, truth)
+    assert n_matched >= 0.95 * len(truth)
+    assert rms < 0.15
+
+
+def test_fwhm_crop_falls_back_to_full_frame_when_center_sparse(monkeypatch):
+    # Stars only in the outer band of a frame larger than the 4096 px
+    # pass-1 crop: the crop sees noise, so FWHM estimation must retry on
+    # the full frame instead of silently using the default FWHM.
+    import senpai.engine.detection.point.sidereal as sid
+
+    sigma = 3.5
+    shape = (4608, 4608)
+    rng = np.random.default_rng(7)
+    image = np.full(shape, 100.0) + rng.normal(0.0, 5.0, shape)
+    truth = []
+    band = [(x, y) for x in range(80, 4530, 220) for y in (80, 180, 4430, 4530)]
+    band += [(x, y) for y in range(400, 4200, 220) for x in (80, 180, 4430, 4530)]
+    for gx, gy in band:
+        x, y = gx + float(rng.uniform(-0.5, 0.5)), gy + float(rng.uniform(-0.5, 0.5))
+        _add_gaussian(image, x, y, 60000.0, sigma)
+        truth.append((x, y))
+
+    seen_shapes = []
+    original = sid._measure_fwhm_sample
+
+    def wrapper(data, bg_stats, initial_fwhm):
+        seen_shapes.append(data.shape)
+        return original(data, bg_stats, initial_fwhm)
+
+    monkeypatch.setattr(sid, "_measure_fwhm_sample", wrapper)
+
+    starlist, fwhm = extract_point_sources(
+        _processed_image(image), max_detections=len(truth)
+    )
+
+    assert seen_shapes[0] == (4096, 4096), "pass 1 must try the central crop first"
+    assert seen_shapes[-1] == shape, "sparse crop must fall back to the full frame"
+    assert fwhm == pytest.approx(SIGMA_TO_FWHM * sigma, abs=1.5)
+    detected = [(d.x, d.y) for d in starlist.detections]
+    n_matched, _ = _centroid_rms(detected, truth)
+    assert n_matched >= 0.9 * len(truth)

@@ -1185,12 +1185,18 @@ def _estimate_streak_seed(
     """Coarse, header-free (length, rotation) seed for the anchor frame.
 
     Found by a normalized matched-filter scale-space search on a central crop:
-    for each (length, angle) a unit-L2 streak kernel is correlated with the
-    image and the (length, angle) with the strongest peak response wins (the
-    normalization makes responses comparable across kernel sizes, so the best
-    match is the true streak scale). Replaces the old ``min(shape)*0.05``
-    default, which on a large frame was ~10x too long and produced a smeared,
-    oversized PSF. This is only a seed — the robust extractor refines it.
+    a unit-L2 streak kernel is correlated with the image and the (length,
+    angle) with the strongest peak response wins (the normalization makes
+    responses comparable across kernel sizes, so the best match is the true
+    streak scale). The search is two-stage rather than an exhaustive grid —
+    angle first at a mid-scale length, then length at the winning angle. An
+    elongated kernel's angle response peaks at the true angle at any
+    plausible length, so the stages decouple (verified identical to the full
+    7x12 grid on real 8k frames at ~1/4 the trials). Trials run in
+    float32: this is peak-picking, not photometry. Replaces the old
+    ``min(shape)*0.05`` default, which on a large frame was ~10x too long
+    and produced a smeared, oversized PSF. This is only a seed — the robust
+    extractor refines it.
     """
     try:
         from scipy.signal import fftconvolve
@@ -1198,22 +1204,36 @@ def _estimate_streak_seed(
         h, w = data.shape
         s = min(crop, h, w)
         y0, x0 = (h - s) // 2, (w - s) // 2
-        c = data[y0:y0 + s, x0:x0 + s].astype(float)
-        c = c - np.median(c)
+        c = data[y0:y0 + s, x0:x0 + s].astype(np.float32)
+        c -= np.median(c)
 
-        best_len, best_rot, best_resp = None, None, -np.inf
-        for L in (12, 18, 27, 40, 60, 90, 135):
-            for ang in range(0, 180, 15):
-                k = rectangle_pyramoid(
-                    L, np.sin(np.deg2rad(ang)), np.cos(np.deg2rad(ang)),
-                    int(fwhm * 2), upsample=1, halo_fwhm=4, halo_level=0,
-                )
-                norm = float(np.sqrt(np.sum(k * k)))
-                if norm <= 0:
-                    continue
-                resp = float(np.max(fftconvolve(c, k / norm, mode="same")))
-                if resp > best_resp:
-                    best_len, best_rot, best_resp = float(L), float(ang), resp
+        def response(length: float, ang: float) -> float:
+            k = rectangle_pyramoid(
+                length, np.sin(np.deg2rad(ang)), np.cos(np.deg2rad(ang)),
+                int(fwhm * 2), upsample=1, halo_fwhm=4, halo_level=0,
+            )
+            norm = float(np.sqrt(np.sum(k * k)))
+            if norm <= 0:
+                return -np.inf
+            kn = (k / norm).astype(np.float32)
+            return float(np.max(fftconvolve(c, kn, mode="same")))
+
+        lengths = (12, 18, 27, 40, 60, 90, 135)
+        mid_length = 40
+
+        best_rot, best_resp = None, -np.inf
+        for ang in range(0, 180, 15):
+            resp = response(mid_length, ang)
+            if resp > best_resp:
+                best_rot, best_resp = float(ang), resp
+        if best_rot is None or not np.isfinite(best_resp):
+            raise ValueError("no matched-filter response")
+
+        best_len, best_resp = None, -np.inf
+        for length in lengths:
+            resp = response(length, best_rot)
+            if resp > best_resp:
+                best_len, best_resp = float(length), resp
         if best_len is None:
             raise ValueError("no matched-filter response")
         logger.info(

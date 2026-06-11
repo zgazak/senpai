@@ -107,3 +107,78 @@ class TestSeedEstimate:
             # Angle within one search step (15 deg), modulo 180.
             d = abs(est_rot - rot) % 180.0
             assert min(d, 180.0 - d) <= 16.0
+
+
+class TestStreakCenterExtraction:
+    """extract_streak_centers_as_sources: matched-filter centroid extraction.
+
+    Pins the local-maxima stage (above-threshold neighborhood test, which
+    replaced a full-frame maximum_filter) and the per-streak dedup: every
+    planted streak yields exactly one centroid at its center.
+    """
+
+    def _streak_grid(self, length=40, rot=30.0, size=1200, seed=3):
+        from senpai.engine.models.metadata import StreakMetadata
+
+        rng = np.random.default_rng(seed)
+        one = _streak(length, rot=rot)  # patch with the streak at its center
+        s = one.shape[0]
+        img = rng.normal(0.0, 5.0, (size, size))
+        centers = []
+        for gy in range(20, size - s - 20, 180):
+            for gx in range(20, size - s - 20, 180):
+                y = gy + int(rng.integers(-10, 10))
+                x = gx + int(rng.integers(-10, 10))
+                img[y:y + s, x:x + s] += one * float(rng.uniform(300, 1500))
+                centers.append((x + s / 2.0, y + s / 2.0))
+        streak = StreakMetadata(
+            pixel_length=float(length),
+            sine_angle=float(np.sin(np.deg2rad(rot))),
+            cosine_angle=float(np.cos(np.deg2rad(rot))),
+            fwhm=8.0,
+        )
+        return img, centers, streak
+
+    def test_one_centroid_per_streak_at_known_centers(self):
+        from senpai.engine.detection.streak.rate_extraction import (
+            extract_streak_centers_as_sources,
+        )
+
+        img, centers, streak = self._streak_grid()
+        sources = extract_streak_centers_as_sources(img, streak=streak, max_sources=100)
+        detected = [(s.x, s.y) for s in sources]
+
+        tol = 5.0
+        matched = 0
+        for cx, cy in centers:
+            hits = [
+                1 for dx, dy in detected
+                if (dx - cx) ** 2 + (dy - cy) ** 2 <= tol**2
+            ]
+            assert len(hits) <= 1, "min-separation must dedup within a streak"
+            matched += len(hits)
+        assert matched >= 0.9 * len(centers)
+
+    def test_noise_field_respects_caps_and_separation(self):
+        # Pure noise legitimately yields 3-sigma matched-filter maxima (by
+        # design — astrometry rejects them); what must hold is the contract:
+        # bounded count and pairwise minimum separation.
+        from senpai.engine.detection.streak.rate_extraction import (
+            extract_streak_centers_as_sources,
+        )
+        from senpai.engine.models.metadata import StreakMetadata
+
+        rng = np.random.default_rng(9)
+        img = rng.normal(0.0, 5.0, (800, 800))
+        length, fwhm = 40.0, 8.0
+        streak = StreakMetadata(
+            pixel_length=length, sine_angle=0.5, cosine_angle=np.sqrt(0.75), fwhm=fwhm
+        )
+        sources = extract_streak_centers_as_sources(img, streak=streak, max_sources=100)
+        assert len(sources) <= 100
+        min_sep = max(length * 0.5, fwhm * 2)
+        pts = [(s.x, s.y) for s in sources]
+        for i in range(len(pts)):
+            for j in range(i + 1, len(pts)):
+                d = np.hypot(pts[i][0] - pts[j][0], pts[i][1] - pts[j][1])
+                assert d >= min_sep
