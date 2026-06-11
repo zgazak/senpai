@@ -109,7 +109,8 @@ def process_astrometry_fits_sidereal(
 
         # Use the new function to measure FWHM
         fwhm_stats = measure_fwhm_from_catalog_stars(
-            fits_image, catalog.stars, initial_fwhm, config
+            fits_image, catalog.stars, initial_fwhm, config,
+            sat_level=sources.sat_level,
         )
         wcs_starfield.fwhm_stats = fwhm_stats
         median_fwhm = fwhm_stats.median_fwhm

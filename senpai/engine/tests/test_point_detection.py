@@ -530,3 +530,81 @@ def test_satellite_threshold_search_matches_daostarfinder():
         if n_ref:
             assert np.allclose(np.sort(np.asarray(got["xcentroid"])), np.sort(np.asarray(ref["xcentroid"])), atol=1e-3)
             assert np.allclose(np.sort(np.asarray(got["ycentroid"])), np.sort(np.asarray(ref["ycentroid"])), atol=1e-3)
+
+
+# ---------------------------------------------------------------------------
+# measure_fwhm_from_catalog_stars: saturation + winged-PSF behavior
+# ---------------------------------------------------------------------------
+def test_catalog_fwhm_skips_clipped_stars_and_measures_truth():
+    # A field with a saturated pile (clipped cores) plus unsaturated stars:
+    # the measured FWHM must come from the unsaturated cohort and match the
+    # true PSF width — the old Gaussian-fit path measured only the faintest
+    # stars (broken catalog-sample sat level) and read ~1.5x wide.
+    sigma = 3.8  # FWHM ~8.9 px
+    rng = np.random.default_rng(21)
+    data = np.full((1400, 1400), 0.0) + rng.normal(0.0, 5.0, (1400, 1400))
+    catalog = []
+    grid = [(x, y) for x in range(120, 1300, 130) for y in range(120, 1300, 130)]
+    for i, (gx, gy) in enumerate(grid):
+        x, y = gx + 0.3, gy + 0.4
+        saturated = i % 3 == 0  # every third star is clipped
+        flux = 4.0e6 if saturated else 3.0e5
+        _add_gaussian(data, x, y, flux, sigma)
+        catalog.append(
+            StarInSpace(ra=0.0, dec=0.0, magnitude=8.0 + 0.05 * i, x=x, y=y)
+        )
+    ceiling = 42000.0
+    np.minimum(data, ceiling, out=data)  # clip the bright cores
+
+    image = _processed_image(data)
+    stats = measure_fwhm_from_catalog_stars(image, catalog, initial_fwhm=8.0)
+    assert stats.median_fwhm == pytest.approx(SIGMA_TO_FWHM * sigma, abs=1.0)
+
+
+def test_catalog_fwhm_uses_detection_sat_level_when_provided():
+    sigma = 3.0
+    rng = np.random.default_rng(22)
+    data = np.full((900, 900), 0.0) + rng.normal(0.0, 4.0, (900, 900))
+    catalog = []
+    for i, (gx, gy) in enumerate([(x, y) for x in range(100, 850, 120) for y in range(100, 850, 120)]):
+        _add_gaussian(data, gx, gy, 2.0e5, sigma)
+        catalog.append(StarInSpace(ra=0.0, dec=0.0, magnitude=9.0 + 0.1 * i, x=float(gx), y=float(gy)))
+
+    image = _processed_image(data)
+    # An absurdly low explicit sat level marks every star saturated ->
+    # no measurements -> falls back to the initial value. Proves the
+    # passed-through level is honored rather than re-estimated.
+    stats = measure_fwhm_from_catalog_stars(
+        image, catalog, initial_fwhm=6.5, sat_level=10.0
+    )
+    assert stats.median_fwhm == pytest.approx(6.5, abs=1e-6)
+
+    # And with the true (permissive) level, the real PSF width is measured.
+    stats = measure_fwhm_from_catalog_stars(
+        image, catalog, initial_fwhm=6.5, sat_level=1.0e9
+    )
+    assert stats.median_fwhm == pytest.approx(SIGMA_TO_FWHM * sigma, abs=1.0)
+
+
+def test_catalog_fwhm_reads_profile_width_on_winged_psf():
+    # Gaussian core + broad shallow wings (Moffat-like): the FWHM is the
+    # composite profile's half-max width — slightly above the core's, far
+    # below what a wing-absorbing single-Gaussian fit can drift to, and far
+    # above the in-box-background half-max-area measure (which folds wing
+    # flux into the sky and read ~30% narrow on real winged frames).
+    sigma = 3.8
+    rng = np.random.default_rng(23)
+    data = np.full((1200, 1200), 0.0) + rng.normal(0.0, 4.0, (1200, 1200))
+    catalog = []
+    for i, (gx, gy) in enumerate([(x, y) for x in range(140, 1100, 150) for y in range(140, 1100, 150)]):
+        x, y = float(gx) + 0.2, float(gy) - 0.3
+        _add_gaussian(data, x, y, 2.5e5, sigma)
+        _add_gaussian(data, x, y, 1.2e5, sigma * 3.0)  # wings
+        catalog.append(StarInSpace(ra=0.0, dec=0.0, magnitude=9.0 + 0.1 * i, x=x, y=y))
+
+    image = _processed_image(data)
+    stats = measure_fwhm_from_catalog_stars(image, catalog, initial_fwhm=8.0)
+    # Wings raise the half-max slightly; allow modest tolerance but pin it
+    # far below the Gaussian-fit failure mode (~1.5x).
+    assert stats.median_fwhm < 1.25 * SIGMA_TO_FWHM * sigma
+    assert stats.median_fwhm > 0.8 * SIGMA_TO_FWHM * sigma

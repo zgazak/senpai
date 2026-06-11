@@ -135,6 +135,12 @@ class SatelliteListImage(BaseModel):
 class StarListImage(BaseModel):
     detections: list[StarInImage] = []
     image_metadata: ImageMetadata
+    # Frame saturation level measured during detection (ADU). Downstream
+    # FWHM measurement reuses it: estimating saturation from a
+    # magnitude-sorted catalog sample is structurally unreliable (the
+    # percentile lands in the faint bulk), whereas the detection-flux-sorted
+    # sample measures it correctly.
+    sat_level: float | None = None
 
     def centers_xy(self) -> np.ndarray:
         return np.array([[star.x, star.y, star.counts] for star in self.detections])

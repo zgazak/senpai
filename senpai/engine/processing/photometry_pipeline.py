@@ -101,7 +101,9 @@ def process_image_photometry(
 
         # Measure FWHM from catalog stars
         logger.info("Measuring FWHM from catalog stars...")
-        fwhm_stats = measure_fwhm_from_catalog_stars(image, catalog.stars, initial_fwhm, app_config)
+        fwhm_stats = measure_fwhm_from_catalog_stars(
+            image, catalog.stars, initial_fwhm, app_config, sat_level=sources.sat_level
+        )
         starfield.fwhm_stats = fwhm_stats
         logger.info(f"FWHM measured: {fwhm_stats.median_fwhm:.2f} pixels (from {fwhm_stats.n_measurements} stars)")
 

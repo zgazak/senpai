@@ -554,5 +554,9 @@ def extract_point_sources(
     logger.info(f"Skipped {sources_skipped_proximity} sources due to proximity")
     logger.info(f"Used minimum separation: {min_separation:.1f} pixels")
 
-    starlist = StarListImage(detections=stars, image_metadata=image.metadata)
+    starlist = StarListImage(
+        detections=stars,
+        image_metadata=image.metadata,
+        sat_level=(float(sat_level) if np.isfinite(sat_level) else None),
+    )
     return starlist, fwhm_pixel
