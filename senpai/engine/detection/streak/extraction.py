@@ -1,7 +1,6 @@
 import logging
 
 import numpy as np
-from numpy.fft import fft2, ifft2
 from scipy.ndimage import median_filter, rotate
 from scipy.optimize import curve_fit
 from scipy.signal import convolve
@@ -1333,7 +1332,10 @@ def extract_streak_dims_robust(
     )
 
     # Step 3: Apply matched filter
-    filtered_data = convolve(working_data, kernel, mode="same")
+    from senpai.engine.utils.stats import fft_workers
+
+    with fft_workers():
+        filtered_data = convolve(working_data, kernel, mode="same")
 
     # Step 4: Clean up borders to avoid edge artifacts
     border_width = max(10, int(length * 0.5))
@@ -2367,8 +2369,15 @@ def cross_corr(img1: np.ndarray, img2: np.ndarray) -> np.ndarray:
     Returns:
         np.ndarray: Cross correlated image
     """
+    # scipy.fft: same pocketfft as numpy's, multithreaded with workers —
+    # identical values, several times faster on full frames.
+    from scipy import fft as sfft
+
     ccf = np.roll(
-        ifft2(fft2(img1).conj() * fft2(img2)).real,
+        sfft.ifft2(
+            sfft.fft2(img1, workers=-1).conj() * sfft.fft2(img2, workers=-1),
+            workers=-1,
+        ).real,
         np.array([img1.shape[0] - 1, img1.shape[1] - 1]) // 2,
         axis=(0, 1),
     )

@@ -17,10 +17,10 @@ from senpai.engine.plotting.wcs_diagnostics import (
     plot_variable_kernel_grid,
     plot_variable_kernel_star_diagnostic,
 )
+from senpai.engine.utils.stats import fft_workers
 from senpai.engine.utils.wcs_helpers import (
     calculate_spatial_coverage,
     compute_snr_and_filter_stars,
-    extract_counts_with_rectangular_aperture,
     find_local_maxima,
     fit_and_validate_wcs,
     match_stars_to_detections,
@@ -131,7 +131,8 @@ def refine_wcs_by_kernel_convolution(frame: RateTrackFrame) -> tuple[float, floa
 
     # Get the kernel
     kernel = frame.streak.to_pyramoid()
-    convolved_image = convolve(frame.frame.data, kernel, mode="same")
+    with fft_workers():
+        convolved_image = convolve(frame.frame.data, kernel, mode="same")
 
     # First pass: Get global shift using astrometric fit stars
     global_shift_x, global_shift_y = get_global_shift_from_astrometric_stars(
@@ -354,11 +355,12 @@ def refine_sidereal_frame(frame: SiderealFrame) -> None:
     """
     config = get_config()
 
-    convolved_image = convolve(
-        frame.frame.data,
-        sidereal_kernel(frame.starfield.detection_metadata.pixel_fwhm),
-        mode="same",
-    )
+    with fft_workers():
+        convolved_image = convolve(
+            frame.frame.data,
+            sidereal_kernel(frame.starfield.detection_metadata.pixel_fwhm),
+            mode="same",
+        )
 
     wcs_model = refine_sidereal_with_catalog_stars(frame, convolved_image)
 
@@ -824,13 +826,10 @@ def refine_wcs_with_catalog_stars(
             )
             continue
 
-        # Extract counts using rectangular aperture
-        counts, _ = extract_counts_with_rectangular_aperture(
-            frame.frame.data, float(measured_x), float(measured_y), frame.streak
-        )
-
-        # Create a detection for this position
-        detection = StarInImage(x=float(measured_x), y=float(measured_y), counts=counts)
+        # Counts are filled in one batched aperture pass after the loop —
+        # they don't influence acceptance, and a per-star photutils call
+        # here cost ~21 ms x 250 stars per frame.
+        detection = StarInImage(x=float(measured_x), y=float(measured_y), counts=0.0)
 
         # Store the detection along with the star and measured position
         filtered_star_data.append((detection, star, measured_x, measured_y))
@@ -853,6 +852,41 @@ def refine_wcs_with_catalog_stars(
     logger.info(
         f"Found {len(filtered_star_data)} well-separated, high-SNR stars for WCS refinement"
     )
+
+    # Fill detection counts in one batched, shared-shape aperture pass
+    # (identical aperture geometry to extract_counts_with_rectangular_aperture).
+    if filtered_star_data:
+        from photutils.aperture import RectangularAnnulus, RectangularAperture
+
+        from senpai.engine.photometry.utils import _shared_shape_aperture_sums
+
+        ap_width = frame.streak.fwhm * 4
+        ap_length = frame.streak.pixel_length + frame.streak.fwhm * 2
+        ap_theta = frame.streak.radian_angle() + np.pi / 2
+        positions = np.array(
+            [(d.x, d.y) for d, _, _, _ in filtered_star_data], dtype=float
+        )
+        flux_sum, bg_sum = _shared_shape_aperture_sums(
+            frame.frame.data,
+            positions,
+            lambda p: [
+                RectangularAperture(p, w=ap_width, h=ap_length, theta=ap_theta),
+                RectangularAnnulus(
+                    p,
+                    w_in=ap_width,
+                    w_out=ap_width + 4,
+                    h_in=ap_length,
+                    h_out=ap_length + 4,
+                    theta=ap_theta,
+                ),
+            ],
+        )
+        aper_area = ap_width * ap_length
+        bg_area = (ap_width + 4) * (ap_length + 4) - aper_area
+        bg_per_pixel = np.where(bg_area > 0, bg_sum / bg_area, 0.0)
+        counts = flux_sum - bg_per_pixel * aper_area
+        for (detection, _, _, _), c in zip(filtered_star_data, counts, strict=True):
+            detection.counts = float(c)
 
     # Update the detections list with just the detection objects
     frame.starfield.detections = [data[0] for data in filtered_star_data]

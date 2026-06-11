@@ -14,7 +14,7 @@ from senpai.engine.detection.streak.extraction import (
 from senpai.engine.models.metadata import StreakMetadata
 from senpai.engine.models.starfield import StarInImage
 from senpai.engine.models.streak_measurement import StreakMeasurement
-from senpai.engine.utils.stats import robust_background_stats
+from senpai.engine.utils.stats import fft_workers, robust_background_stats
 
 logger = logging.getLogger(__name__)
 
@@ -127,7 +127,8 @@ def extract_streak_centers_as_sources(
         f"Convolving image with streak-matched kernel "
         f"(L={streak_length:.1f}px, \u03b8={streak_angle_deg:.1f}\u00b0, W={streak_fwhm:.1f}px)"
     )
-    convolved = convolve(image.astype(np.float32), kernel, mode="same")
+    with fft_workers():
+        convolved = convolve(image.astype(np.float32), kernel, mode="same")
 
     # Estimate background statistics from the convolved image: sigma-clipped
     # for outlier robustness, on a strided subsample (threshold shift vs the

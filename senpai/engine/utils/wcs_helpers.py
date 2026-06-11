@@ -29,6 +29,33 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
+def _local_maxima_above_floor(image, half, floor):
+    """(ys, xs, values) of pixels above ``floor`` that equal the maximum of
+    their (2*half+1)^2 window, matching ``maximum_filter(mode='constant')``
+    semantics for positive floors (out-of-bounds zeros never beat an
+    above-floor pixel). Offsets run nearest-first so almost every
+    non-maximum dies on an immediate neighbor before the wide scans."""
+    ys, xs = np.nonzero(image > floor)
+    vals = image[ys, xs]
+    h, w = image.shape
+    for radius in range(1, half + 1):
+        ring = [
+            (dy, dx)
+            for dy in range(-radius, radius + 1)
+            for dx in range(-radius, radius + 1)
+            if max(abs(dy), abs(dx)) == radius
+        ]
+        for dy, dx in ring:
+            if ys.size == 0:
+                return ys, xs, vals
+            yy, xx = ys + dy, xs + dx
+            keep = np.ones(ys.size, dtype=bool)
+            inb = (yy >= 0) & (yy < h) & (xx >= 0) & (xx < w)
+            keep[inb] = vals[inb] >= image[yy[inb], xx[inb]]
+            ys, xs, vals = ys[keep], xs[keep], vals[keep]
+    return ys, xs, vals
+
+
 def find_local_maxima(image, min_distance=30, threshold=None, max_detections=None):
     """
     Find local maxima in an image with minimum separation distance.
@@ -42,15 +69,33 @@ def find_local_maxima(image, min_distance=30, threshold=None, max_detections=Non
     Returns:
         Array of (y, x) coordinates of maxima
     """
+    size = 2 * min_distance + 1
+    floor_base = max(0.0, float(threshold) if threshold is not None else 0.0)
+
+    if max_detections is not None:
+        # Fast path: only the brightest max_detections maxima are wanted, so
+        # probe with a descending ladder of intensity floors and test only
+        # above-floor pixels against their neighborhood — a full-frame
+        # 61x61 maximum_filter costs ~1.3 s per call. Any maximum excluded
+        # by a floor is dimmer than the ones found above it, so once enough
+        # are found the brightest set is exact; identical to the filter
+        # path (which this falls back to if the ladder never yields enough).
+        sample = image[::8, ::8]
+        for q in (99.99, 99.9, 99.0):
+            floor = float(np.percentile(sample, q))
+            if floor <= floor_base:
+                break
+            ys, xs, vals = _local_maxima_above_floor(image, min_distance, floor)
+            if ys.size >= max_detections:
+                order = np.argsort(-vals)[:max_detections]
+                return np.column_stack((ys[order], xs[order]))
+
     # Apply threshold if provided
     if threshold is not None:
         mask = image > threshold
         filtered_image = image * mask
     else:
         filtered_image = image.copy()
-
-    # Find local maxima
-    size = 2 * min_distance + 1
 
     # Apply maximum filter
     maximum_filtered = maximum_filter(filtered_image, size=size, mode="constant")
@@ -104,30 +149,19 @@ def match_stars_to_detections(
     if not stars or len(detected_points) == 0:
         return [], list(range(len(stars))), list(range(len(detected_points)))
 
-    # Create distance matrix
-    cost_matrix = np.zeros((len(stars), len(detected_points)))
-
-    # Check if we have any valid matches at all
-    all_infinite = True
-
-    for i, star in enumerate(stars):
-        if star is None:
-            # If star is None, set all costs to infinity
-            cost_matrix[i, :] = np.inf
-            continue
-
-        for j, (y, x) in enumerate(detected_points):
-            # Calculate Euclidean distance
-            dx = star.x - x
-            dy = star.y - y
-            distance = np.sqrt(dx**2 + dy**2)
-
-            # Set cost to distance (no infinity cutoff here)
-            cost_matrix[i, j] = distance
-            all_infinite = False
+    # Distance matrix, vectorized: the python double loop cost ~2 s per call
+    # against a full 18k-star catalog. None stars get infinite cost rows
+    # (never assigned), as before.
+    star_x = np.array([s.x if s is not None else np.nan for s in stars], dtype=float)
+    star_y = np.array([s.y if s is not None else np.nan for s in stars], dtype=float)
+    det = np.asarray(detected_points, dtype=float)  # rows are (y, x)
+    cost_matrix = np.hypot(
+        star_x[:, None] - det[None, :, 1], star_y[:, None] - det[None, :, 0]
+    )
+    cost_matrix[~np.isfinite(cost_matrix)] = np.inf
 
     # If all costs are infinite, return empty matches
-    if all_infinite:
+    if not np.isfinite(cost_matrix).any():
         return [], list(range(len(stars))), list(range(len(detected_points)))
 
     # Solve the assignment problem

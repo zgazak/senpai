@@ -724,9 +724,12 @@ def preprocess_image(
     fname = Path(image.file_path).name if image.file_path else "?"
 
     def log_stats(stage, arr):
+        # Median on a stride-8 subsample: this is a diagnostic log line, and
+        # four full-frame medians per frame cost ~1 s each on 66 Mpix.
         logger.info(
             "[%s] %s: min=%.1f, max=%.1f, median=%.1f, mean=%.1f",
-            fname, stage, np.min(arr), np.max(arr), np.median(arr), np.mean(arr),
+            fname, stage, np.min(arr), np.max(arr),
+            np.median(arr[::8, ::8]), np.mean(arr),
         )
 
     log_stats("loaded", image.data)

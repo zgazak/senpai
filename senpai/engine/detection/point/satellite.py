@@ -20,7 +20,7 @@ from senpai.engine.detection.streak.masking import percent_difference
 from senpai.engine.models.senpai import RateTrackFrame
 from senpai.engine.models.starfield import SatelliteInImage, SatelliteListImage
 from senpai.engine.plotting.images import plot_single_frame
-from senpai.engine.utils.stats import robust_background_stats
+from senpai.engine.utils.stats import fft_workers, robust_background_stats
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +56,14 @@ def _local_maxima_above(
     h, w = convolved.shape
     cy, cx = (footprint.shape[0] - 1) // 2, (footprint.shape[1] - 1) // 2
     fy, fx = np.nonzero(footprint)
-    for dy, dx in zip(fy - cy, fx - cx, strict=True):
+    # Nearest offsets first: in a kernel-smoothed image almost every
+    # non-maximum candidate is beaten by an immediate neighbor, so the
+    # candidate set collapses within the first ring and the remaining
+    # offsets scan a tiny survivor list.
+    offsets = sorted(
+        zip(fy - cy, fx - cx, strict=True), key=lambda d: max(abs(d[0]), abs(d[1]))
+    )
+    for dy, dx in offsets:
         if (dy == 0 and dx == 0) or ys.size == 0:
             continue
         yy, xx = ys + dy, xs + dx
@@ -476,21 +483,38 @@ def extract_point_sources(frame: RateTrackFrame) -> SatelliteListImage:
     min_sources = 50
     max_sources = 300  # Adjust this value as needed
 
-    # One kernel convolution and one local-maxima pass serve every threshold
-    # attempt below (see _dao_sources_at_threshold). The FFT convolution is
-    # the same linear operation photutils applies directly; local maxima are
-    # found once at the search's lower threshold bound, and higher-threshold
-    # attempts select from them.
+    # One kernel convolution serves every threshold attempt below (see
+    # _dao_sources_at_threshold). The FFT convolution is the same linear
+    # operation photutils applies directly. Candidates are gathered lazily
+    # at the lowest threshold visited so far: a local maximum above any
+    # lower floor filtered to the attempt threshold is exactly the maxima
+    # set at that threshold, and the binary search starts at 10 sigma and
+    # rarely descends toward the 3 sigma floor — where the candidate set is
+    # ~50x larger and its local-maxima pass costs seconds.
     kernel = _StarFinderKernel(float(fwhm), ratio=1.0, theta=0.0, sigma_radius=1.5)
-    convolved = fftconvolve(
-        image_data_sub.astype(np.float32), kernel.data.astype(np.float32), mode="same"
-    )
-    cand_ys, cand_xs, cand_vals = _local_maxima_above(
-        convolved, kernel.mask.astype(bool), threshold_min * kernel.relerr
-    )
-    cand_xy = np.column_stack((cand_xs, cand_ys))
+    with fft_workers():
+        convolved = fftconvolve(
+            image_data_sub.astype(np.float32),
+            kernel.data.astype(np.float32),
+            mode="same",
+        )
+
+    gathered_floor = None
+    cand_xy = cand_vals = None
+
+    def ensure_candidates(min_threshold: float) -> None:
+        nonlocal gathered_floor, cand_xy, cand_vals
+        if gathered_floor is not None and gathered_floor <= min_threshold:
+            return
+        ys, xs, vals = _local_maxima_above(
+            convolved, kernel.mask.astype(bool), min_threshold * kernel.relerr
+        )
+        cand_xy = np.column_stack((xs, ys))
+        cand_vals = vals
+        gathered_floor = min_threshold
 
     while attempts < max_attempts:
+        ensure_candidates(threshold)
         sources = _dao_sources_at_threshold(
             image_data_sub,
             convolved,
