@@ -389,6 +389,10 @@ class NightCalibration:
     limiting_mag_p50_per_filter: dict[str, float] = field(default_factory=dict)
     limiting_mag_p90_per_filter: dict[str, float] = field(default_factory=dict)
     moon_illumination: float | None = None  # 0–1 fraction at mid-night
+    # Night output dir (holds manifest.json + batches/). Kept so pixel-level
+    # plots (PSF profile) can re-read the few frames they need + their raw FITS;
+    # not a calibration product, so it is intentionally excluded from to_dict().
+    source_dir: str | None = None
 
     def conditions(self) -> dict[str, Any]:
         """One-line-per-night observing-conditions summary (PSF, sky, extinction,
@@ -759,6 +763,7 @@ def analyze_night(night_dir: str | Path) -> NightCalibration:
         n_frames_with_photometry=len(frames),
         n_frames_with_wcs=n_with_wcs,
         frames=frames,
+        source_dir=str(night_dir),
     )
     _add_moon_geometry(calib)
     calib.zp_per_filter = _summarize_zp(frames)
@@ -996,35 +1001,6 @@ def _render_limiting_magnitude_hist(d, meta, output_dir, plt, np) -> Path:
     ax.legend(loc="best", fontsize=9)
     ax.grid(True, alpha=0.3)
     return _save(fig, output_dir / "limiting_magnitude_hist.png")
-
-
-def _data_depth_vs_exposure(calib: NightCalibration):
-    pts = [(f.exposure_time, f.limiting_magnitude_50, f.airmass)
-           for f in _zp_frames(calib.frames)
-           if f.exposure_time and f.limiting_magnitude_50]
-    if not pts:
-        return None
-    return {
-        "exposure": [p[0] for p in pts],
-        "lim50": [p[1] for p in pts],
-        "airmass": [p[2] if p[2] is not None else 0.0 for p in pts],
-    }
-
-
-def _render_depth_vs_exposure(d, meta, output_dir, plt, np) -> Path:
-    fig, ax = plt.subplots(figsize=(8, 5))
-    cs = d["airmass"]
-    sc = ax.scatter(d["exposure"], d["lim50"], c=cs, cmap="viridis", s=24,
-                    alpha=0.8, edgecolor="black", linewidth=0.3)
-    ax.set_xscale("log")
-    ax.set_xlabel("exposure time (s)")
-    ax.set_ylabel("limiting magnitude (50% completeness)")
-    ax.set_title(f"{meta['night_id']}: depth vs exposure time")
-    ax.grid(True, alpha=0.3)
-    if any(c > 0 for c in cs):
-        cb = plt.colorbar(sc, ax=ax)
-        cb.set_label("airmass")
-    return _save(fig, output_dir / "depth_vs_exposure.png")
 
 
 def _data_extinction_curve(calib: NightCalibration):
@@ -1472,15 +1448,265 @@ def _render_slew_model(d, meta, output_dir, plt, np) -> Path:
     return _save(fig, output_dir / "slew_model.png")
 
 
+# --- empirical PSF profile by seeing band -------------------------------------
+# The per-frame FWHM is one number; the actual PSF *shape* (core sharpness, wing
+# strength, x/y elongation) needs the pixels. We bin the night's sidereal frames
+# into a few seeing bands by detection FWHM, and for each band take the single
+# clearest (highest-ZP) frame with enough stars, median-stack subpixel-aligned
+# stamps of its bright, isolated, unsaturated catalog stars from the raw FITS,
+# then read off the azimuthally-averaged radial profile + x/y cuts. This reuses
+# the approach proven in scripts/psf_vs_exposure.py, re-binned by seeing.
+_PSF_STAMP_HALF = 30      # stamp is (2*half+1)² px
+_PSF_SAT_PEAK = 40000.0   # raw ADU; reject saturated stars (well below 65535)
+_PSF_ISO_RADIUS = 60.0    # px; no neighbor brighter than mag+2 within this
+_PSF_MAX_STARS = 200      # stamps to stack per frame
+_PSF_MIN_STARS_FRAME = 200  # need a well-populated field to pick from
+_PSF_MIN_STAMPS = 15      # min stacked stars for a usable profile
+_PSF_N_BANDS = 3
+
+
+def _batch_result_paths(source_dir: str) -> dict[str, Path]:
+    """{batch_id: result JSON path}, re-anchored on source_dir when the
+    manifest's absolute paths are stale (drive remounted elsewhere)."""
+    import glob as _glob
+    md = json.loads((Path(source_dir) / "manifest.json").read_text())
+    out: dict[str, Path] = {}
+    for e in md.get("batches", []):
+        bid = e.get("batch_id")
+        if not bid:
+            continue
+        rp = e.get("result_path")
+        p = Path(rp) if rp else None
+        if p is None or not p.is_file():
+            hits = _glob.glob(str(Path(source_dir) / "batches" / bid / "senpai_*.json"))
+            if not hits:
+                continue
+            p = Path(hits[0])
+        out[bid] = p
+    return out
+
+
+def _sidereal_frame_dict(batch_path: Path, index: int) -> dict | None:
+    try:
+        run = json.loads(batch_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    for fr in run.get("sidereal_frames", []):
+        if int(fr.get("index", -2)) == index:
+            return fr
+    return None
+
+
+def _psf_stack_stamp(fits_path: str, catalog_stars: list, fwhm: float, half: int):
+    """Median-stacked, peak-normalized PSF stamp from a frame's bright, isolated,
+    unsaturated catalog stars. Returns (stamp2d, n_stars) or (None, 0)."""
+    import numpy as np
+    from astropy.io import fits
+    from scipy import ndimage
+    from scipy.spatial import cKDTree
+
+    try:
+        data = fits.getdata(fits_path).astype(np.float64)
+    except Exception:
+        return None, 0
+    h, w = data.shape
+    keep = [s for s in catalog_stars
+            if s.get("x") is not None and s.get("y") is not None]
+    if len(keep) < 20:
+        return None, 0
+    xy = np.array([(s["x"], s["y"]) for s in keep])
+    mags = np.array([s.get("magnitude") if s.get("magnitude") is not None
+                     else np.inf for s in keep])
+    tree = cKDTree(xy)
+    n = 2 * half + 1
+    stamps = []
+    for i in np.argsort(mags):              # brightest first
+        if len(stamps) >= _PSF_MAX_STARS:
+            break
+        x, y = xy[i]
+        if not (half + 2 < x < w - half - 2 and half + 2 < y < h - half - 2):
+            continue
+        neigh = tree.query_ball_point((x, y), _PSF_ISO_RADIUS)
+        if any(j != i and mags[j] < mags[i] + 2.0 for j in neigh):
+            continue
+        xi, yi = int(round(x)), int(round(y))
+        st = data[yi - half:yi + half + 1, xi - half:xi + half + 1].copy()
+        if st.shape != (n, n):
+            continue
+        ring = np.concatenate([st[0:4].ravel(), st[-4:].ravel(),
+                               st[:, 0:4].ravel(), st[:, -4:].ravel()])
+        st -= np.median(ring)
+        mx = st.max()
+        if mx > _PSF_SAT_PEAK or mx <= 0:
+            continue
+        cy, cx = ndimage.center_of_mass(np.clip(st, 0, None))
+        if not (np.isfinite(cx) and np.isfinite(cy)):
+            continue
+        if abs(cy - half) > fwhm or abs(cx - half) > fwhm:
+            continue                        # centroid far off — blend/artifact
+        st = ndimage.shift(st, (half - cy, half - cx), order=3, mode="nearest")
+        st /= st.max()
+        stamps.append(st)
+    if len(stamps) < _PSF_MIN_STAMPS:
+        return None, 0
+    return np.median(np.stack(stamps), axis=0), len(stamps)
+
+
+def _radial_profile(stamp, half, np, rstep=0.5):
+    """Azimuthally-averaged (ring-median) radial profile, peak-normalized."""
+    n = stamp.shape[0]
+    yy, xx = np.mgrid[0:n, 0:n]
+    rr = np.hypot(xx - half, yy - half)
+    edges = np.arange(0.0, half + rstep, rstep)
+    r, prof = [], []
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        m = (rr >= lo) & (rr < hi)
+        if m.any():
+            r.append((lo + hi) / 2)
+            prof.append(float(np.median(stamp[m])))
+    prof = np.array(prof)
+    if prof.size and prof.max() > 0:
+        prof = prof / prof.max()
+    return np.array(r), prof
+
+
+def _cut_fwhm(profile, np) -> float:
+    """FWHM from half-max crossings of a 1D cut through the peak."""
+    profile = np.asarray(profile)
+    half = profile.max() / 2.0
+    above = np.where(profile >= half)[0]
+    if len(above) < 2:
+        return float("nan")
+    lo, hi = int(above[0]), int(above[-1])
+    left = (lo - (profile[lo] - half) / (profile[lo] - profile[lo - 1])
+            if lo > 0 and profile[lo] != profile[lo - 1] else float(lo))
+    right = (hi + (profile[hi] - half) / (profile[hi] - profile[hi + 1])
+             if hi < len(profile) - 1 and profile[hi] != profile[hi + 1]
+             else float(hi))
+    return float(right - left)
+
+
+def _data_psf_profile(calib: NightCalibration):
+    import numpy as np
+
+    if not calib.source_dir:
+        return None
+    cands = [f for f in calib.frames
+             if f.track_mode == "sidereal" and f.fwhm_px and f.zero_point
+             and f.batch_id and f.frame_index is not None and f.frame_index >= 0
+             and (f.n_stars or 0) >= _PSF_MIN_STARS_FRAME]
+    if len(cands) < 2 * _PSF_N_BANDS:
+        return None
+    try:
+        batch_paths = _batch_result_paths(calib.source_dir)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not batch_paths:
+        return None
+
+    fwhms = np.array([f.fwhm_px for f in cands])
+    edges = np.percentile(fwhms, np.linspace(0, 100, _PSF_N_BANDS + 1))
+    half = _PSF_STAMP_HALF
+    bands = []
+    for i in range(_PSF_N_BANDS):
+        lo, hi = float(edges[i]), float(edges[i + 1])
+        in_band = [f for f in cands if lo <= f.fwhm_px <=
+                   (hi if i == _PSF_N_BANDS - 1 else hi - 1e-9)]
+        if not in_band:
+            continue
+        in_band.sort(key=lambda f: -f.zero_point)   # clearest first
+        picked = None
+        for f in in_band[:8]:                        # try a few before giving up
+            bp = batch_paths.get(f.batch_id)
+            if not bp or not bp.is_file():
+                continue
+            fd = _sidereal_frame_dict(bp, f.frame_index)
+            if not fd:
+                continue
+            fp = fd.get("original_frame_path")
+            stars = (fd.get("starfield") or {}).get("catalog_stars") or []
+            if not fp or not Path(fp).is_file() or len(stars) < _PSF_MIN_STARS_FRAME:
+                continue
+            stamp, n = _psf_stack_stamp(fp, stars, f.fwhm_px, half)
+            if stamp is not None:
+                picked = (f, stamp, n)
+                break
+        if picked is None:
+            continue
+        f, stamp, n = picked
+        xcut = stamp[half, :]
+        ycut = stamp[:, half]
+        r, radial = _radial_profile(stamp, half, np)
+        bands.append({
+            "fwhm_lo": lo, "fwhm_hi": hi, "fwhm_det": float(f.fwhm_px),
+            "fwhm_x": _cut_fwhm(xcut, np), "fwhm_y": _cut_fwhm(ycut, np),
+            "n_stars": int(n), "zp": float(f.zero_point),
+            "exposure": f.exposure_time,
+            "timestamp": f.timestamp.isoformat() if f.timestamp else None,
+            "axis": (np.arange(stamp.shape[0]) - half).tolist(),
+            "x_cut": xcut.tolist(), "y_cut": ycut.tolist(),
+            "r": r.tolist(), "radial": radial.tolist(),
+        })
+    if not bands:
+        return None
+    psc = next((f.pixel_scale_arcsec for f in cands if f.pixel_scale_arcsec), None)
+    return {"half": half, "bands": bands, "pixel_scale_arcsec": psc}
+
+
+def _render_psf_profile(d, meta, output_dir, plt, np) -> Path:
+    bands = d["bands"]
+    half = d["half"]
+    psc = d.get("pixel_scale_arcsec")
+    colors = plt.cm.viridis(np.linspace(0.12, 0.85, len(bands)))
+    fig, (axr, axc) = plt.subplots(1, 2, figsize=(13, 6))
+
+    win = 0.0
+    for b, c in zip(bands, colors):
+        sec = f" ({b['fwhm_det']*psc:.1f}\")" if psc else ""
+        lbl = (f"FWHM {b['fwhm_lo']:.1f}–{b['fwhm_hi']:.1f}px{sec}  "
+               f"x/y={b['fwhm_x']:.1f}/{b['fwhm_y']:.1f}px, n={b['n_stars']}")
+        axr.plot(b["r"], np.clip(b["radial"], 1e-4, None), color=c, lw=2,
+                 label=lbl)
+        ax = b["axis"]
+        axc.plot(ax, b["x_cut"], color=c, lw=2.0, ls="-")
+        axc.plot(ax, b["y_cut"], color=c, lw=1.5, ls="--")
+        win = max(win, 3.0 * max(b["fwhm_x"], b["fwhm_y"]))
+
+    axr.set_yscale("log")
+    axr.set_ylim(1e-3, 1.3)
+    axr.set_xlim(0, half)
+    axr.set_xlabel("radius (px)")
+    axr.set_ylabel("normalized flux (peak = 1)")
+    axr.set_title("azimuthally-averaged radial profile")
+    axr.grid(True, which="both", alpha=0.3)
+    axr.legend(fontsize=8, loc="upper right")
+
+    win = min(half, max(12.0, win))
+    axc.axhline(0.5, color="gray", ls=":", lw=1)
+    axc.set_xlim(-win, win)
+    axc.set_ylim(-0.05, 1.05)
+    axc.set_xlabel("Δ from center (px)")
+    axc.set_ylabel("normalized flux")
+    axc.set_title("x cut (solid) & y cut (dashed)")
+    axc.grid(True, alpha=0.3)
+
+    scale_txt = f"   plate scale {psc:.2f}\"/px" if psc else ""
+    fig.suptitle(f"{meta['night_id']}: empirical PSF profile by seeing band "
+                 f"(clearest frame per band, median stack of isolated "
+                 f"stars){scale_txt}", fontsize=12)
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    return _save(fig, output_dir / "psf_profile.png")
+
+
 _PLOT_BUILDERS.update({
     "extinction_curve": (_data_extinction_curve, _render_extinction_curve),
     "limiting_magnitude_hist": (
         _data_limiting_magnitude_hist, _render_limiting_magnitude_hist),
     "alt_az_coverage": (_data_alt_az_coverage, _render_alt_az_coverage),
     "zp_drift": (_data_zp_drift, _render_zp_drift),
-    "depth_vs_exposure": (_data_depth_vs_exposure, _render_depth_vs_exposure),
     "search_rate": (_data_search_rate, _render_search_rate),
     "slew_model": (_data_slew_model, _render_slew_model),
+    "psf_profile": (_data_psf_profile, _render_psf_profile),
 })
 
 
