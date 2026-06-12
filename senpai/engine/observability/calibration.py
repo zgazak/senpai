@@ -1197,31 +1197,180 @@ def _render_zp_drift(d, meta, output_dir, plt, np) -> Path:
     return _save(fig, output_dir / "zp_drift.png")
 
 
+# --- inter-frame overhead (slew + settle + readout) model ---------------------
+# DATE-OBS is the exposure START, so for time-ordered frames i -> i+1 the gap
+# between successive starts decomposes as
+#     Δt = exposure[i] + readout + settle + slew_time(separation)
+# and the per-pair "overhead" Δt - exposure[i] is readout-only when the mount
+# does not move (repeat exposures at one pointing) and gains a fixed settle step
+# plus a distance-proportional slew term whenever it does. We fit that two-regime
+# model from the night's own telemetry rather than assuming a flat overhead.
+_SLEW_READOUT_MAX_DEG = 0.1   # below this separation: no slew, overhead==readout
+_SLEW_MIN_DEG = 0.25          # at/above this separation: treat as a real slew
+_SLEW_MAX_GAP_S = 300.0       # drop pairs spanning focus runs / weather pauses
+_SLEW_ENV_PCTILE = 10         # lower-envelope percentile = physical floor per bin
+_SLEW_ENV_MIN_PTS = 6         # min pairs per distance bin to anchor the envelope
+_SLEW_DIST_BINS = [0.25, 0.5, 1, 2, 4, 8, 15, 25, 40, 60, 90, 180]
+
+
+def _angsep_deg(alt1, az1, alt2, az2) -> float:
+    """Great-circle separation (deg) in the mount's alt/az frame — the same
+    slew metric burr's coverage optimizer uses."""
+    a1, a2 = math.radians(alt1), math.radians(alt2)
+    d = (math.sin((a2 - a1) / 2) ** 2
+         + math.cos(a1) * math.cos(a2) * math.sin(math.radians(az2 - az1) / 2) ** 2)
+    return math.degrees(2 * math.asin(min(1.0, math.sqrt(d))))
+
+
+def _fit_slew_model(frames: list[FramePhoto]) -> dict | None:
+    """Fit the inter-frame overhead model (readout + settle + slew) from the
+    night's time-ordered frames.
+
+    Pairs are consecutive in time across ALL frames (sidereal and rate) — sorting
+    a single track mode would skip over interleaved frames and inflate the gaps.
+    The lower-envelope (per-bin p10) fit is robust to the minority of pairs whose
+    separation is rate-track motion rather than a slew, and to contingent delays
+    (plate-solve retries, downloads) that only ever sit *above* the floor.
+
+    Returns the fitted scalars, the contiguous-grid cadence overhead (one
+    FoV-width slew), and the raw (separation, overhead) cloud + envelope for
+    plotting; or None if there aren't enough usable pairs.
+    """
+    import numpy as np
+
+    fr = sorted(
+        (f for f in frames
+         if f.timestamp and f.exposure_time
+         and f.altitude_deg is not None and f.azimuth_deg is not None),
+        key=lambda f: f.timestamp,
+    )
+    dist, over = [], []
+    for a, b in zip(fr, fr[1:]):
+        dt = (b.timestamp - a.timestamp).total_seconds()
+        ov = dt - a.exposure_time            # DATE-OBS = exposure start
+        if ov <= 0 or dt >= _SLEW_MAX_GAP_S:  # clock glitch / long pause
+            continue
+        dist.append(_angsep_deg(a.altitude_deg, a.azimuth_deg,
+                                b.altitude_deg, b.azimuth_deg))
+        over.append(ov)
+    if len(dist) < 2 * _SLEW_ENV_MIN_PTS:
+        return None
+    dist, over = np.array(dist), np.array(over)
+
+    # Readout floor: overhead when the mount does not move (repeat exposures).
+    same = dist < _SLEW_READOUT_MAX_DEG
+    if int(same.sum()) < _SLEW_ENV_MIN_PTS:
+        return None
+    readout = float(np.median(over[same]))
+
+    # Slew regime: per-bin lower envelope, then a count-weighted line
+    # overhead = bias + separation / slew_rate  (bias = readout + settle).
+    edges = np.array(_SLEW_DIST_BINS)
+    ex, ey, en = [], [], []
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        m = (dist >= lo) & (dist < hi)
+        if int(m.sum()) >= _SLEW_ENV_MIN_PTS:
+            ex.append(float(np.median(dist[m])))
+            ey.append(float(np.percentile(over[m], _SLEW_ENV_PCTILE)))
+            en.append(int(m.sum()))
+    if len(ex) < 2:
+        return None
+    ex_a, ey_a, w = np.array(ex), np.array(ey), np.sqrt(np.array(en, float))
+    A = np.vstack([np.ones_like(ex_a), ex_a]).T * w[:, None]
+    (bias, slope), *_ = np.linalg.lstsq(A, ey_a * w, rcond=None)
+    if slope <= 0:        # degenerate / inverted — no usable slew term
+        return None
+    slew_rate = 1.0 / slope
+    settle = float(bias) - readout
+
+    fovs = [f.fov_sq_deg for f in fr if f.fov_sq_deg]
+    fov_width = math.sqrt(float(np.median(fovs))) if fovs else None
+    # Contiguous grid search: each step slews one FoV width to the next tile.
+    grid_overhead = float(bias) + (fov_width / slew_rate if fov_width else 0.0)
+
+    return {
+        "readout_s": readout,
+        "settle_s": settle,
+        "slew_rate_deg_s": slew_rate,
+        "bias_s": float(bias),
+        "fov_width_deg": fov_width,
+        "grid_overhead_s": grid_overhead,
+        "n_pairs": int(len(dist)),
+        "n_slew": int((dist >= _SLEW_MIN_DEG).sum()),
+        "dist": dist,
+        "overhead": over,
+        "env": {"x": ex, "y": ey, "n": en},
+    }
+
+
 def _data_search_rate(calib: NightCalibration):
     import numpy as np
 
-    # Target SNR = measurement floor = 3σ: the search rate is the sky area/hour
-    # surveyable while still reaching a 3σ detection per field.
-    target_snr, min_exposure_s, readout_s, min_meas_snr = 3.0, 0.1, 1.0, 3.0
-    star_pts, lim50s = [], []
+    # Search rate = sky area/hour surveyable while still reaching a TARGET-σ (3σ)
+    # detection per field. A star measured at SNR s in a known exposure pins its
+    # flux, so the time to reach target_snr is t_req = exp·(target_snr/s)² — valid
+    # for *any* s>0, giving each star a search rate fov/(t_req+overhead)·3600.
+    #
+    # Naively this leaves two artifacts at the faint/slow end:
+    #   1. A blank band below fov·3600/(max_exp·9 + overhead): a star at the
+    #      detection threshold in the LONGEST exposure sets the slowest rate the
+    #      exposure ladder can probe (≈157 deg²/h here for 10s max). Slower rates
+    #      need longer exposures, not present in this data.
+    #   2. A noise floor: a blank aperture still returns SNR≈1, so measured SNR
+    #      never falls to 0 even well past the limit (it plateaus at ~0.9σ).
+    # We remove the noise floor by subtracting it in QUADRATURE — the standard
+    # debiasing when noise adds in quadrature to a significance measurement:
+    #   s_signal = √(max(s² − s_noise², 0))
+    # Bright stars are essentially unchanged (√(s²−n²)≈s); stars at the noise
+    # level go to zero signal → rate 0. This fills the faint/slow band with the
+    # real (small) search rates that ARE in the data in aggregate, while the curve
+    # still reaches 0 at the true limit instead of a 1σ cliff or a noise plateau.
+    # s_noise is measured per-night as the median SNR of stars well past the
+    # limiting magnitude, where the flux is negligible and the SNR is pure noise.
+    #
+    # The per-field cadence is exposure + inter-frame overhead, where the overhead
+    # is the fitted contiguous-grid value (readout + settle + one-FoV-width slew)
+    # rather than a flat guess; it falls back to 1.0s if the slew fit is unusable.
+    target_snr, min_exposure_s = 3.0, 0.1
+    slew = _fit_slew_model(calib.frames)
+    overhead_s = slew["grid_overhead_s"] if slew else 1.0
+
+    m_l, s_l, e_l, fov_l, lim_l, lim50s = [], [], [], [], [], []
     for f in _zp_frames(calib.frames):
         if not f.exposure_time or not f.fov_sq_deg or not f.stars_mag:
             continue
         if f.limiting_magnitude_50 is not None:
             lim50s.append(f.limiting_magnitude_50)
+        lim = f.limiting_magnitude_50 if f.limiting_magnitude_50 is not None else np.nan
         for m, s, iso in zip(f.stars_mag, f.stars_snr, _isolated_flags(f)):
             if not iso:
                 continue
-            if s < min_meas_snr:
-                star_pts.append((m, 0.0))
-            elif _snr_consistent(s, m, f):
-                t_req = max(f.exposure_time * (target_snr / s) ** 2,
-                            min_exposure_s)
-                star_pts.append((m, f.fov_sq_deg / (t_req + readout_s) * 3600.0))
-    if not star_pts:
+            m_l.append(m); s_l.append(s); e_l.append(f.exposure_time)
+            fov_l.append(f.fov_sq_deg); lim_l.append(lim)
+    if not m_l:
         return None
-    mags = np.array([p[0] for p in star_pts])
-    rates = np.array([p[1] for p in star_pts])
+    mg = np.array(m_l); sn = np.array(s_l); ex = np.array(e_l)
+    fv = np.array(fov_l); lim = np.array(lim_l)
+    median_lim50 = float(np.median(lim50s)) if lim50s else None
+
+    # Noise-floor SNR: median SNR of stars ≥2.5 mag past the limit (pure noise).
+    faint = (mg > median_lim50 + 2.5) if median_lim50 is not None \
+        else (mg > np.percentile(mg, 95))
+    s_noise = float(np.median(sn[faint])) if int(faint.sum()) >= 100 else 0.9
+
+    # Reject spuriously-high SNR (bright-star wings, bad matches): >5× predicted.
+    with np.errstate(over="ignore", invalid="ignore"):
+        snr_pred = 3.0 * 10 ** (0.4 * (lim - mg))
+    consistent = np.isnan(lim) | (sn <= 5.0 * snr_pred)
+
+    s_sig = np.sqrt(np.clip(sn ** 2 - s_noise ** 2, 0.0, None))
+    detect = s_sig > 0
+    t_req = np.clip(ex * (target_snr / np.where(detect, s_sig, 1.0)) ** 2,
+                    min_exposure_s, None)
+    rate_all = np.where(detect, fv / (t_req + overhead_s) * 3600.0, 0.0)
+
+    mags = mg[consistent]
+    rates = rate_all[consistent]
     bin_width = 0.5
     bin_edges = np.arange(math.floor(mags.min() / bin_width) * bin_width,
                           mags.max() + bin_width, bin_width)
@@ -1238,9 +1387,15 @@ def _data_search_rate(calib: NightCalibration):
     return {
         "mags": mags, "rates": rates,
         "binned": {"x": centers, "y": medians, "err_lo": err_lo, "err_hi": err_hi},
-        "median_lim50": float(np.median(lim50s)) if lim50s else None,
-        "n_stars": len(star_pts), "target_snr": target_snr,
-        "min_meas_snr": min_meas_snr,
+        "median_lim50": median_lim50,
+        "n_stars": int(len(mags)), "target_snr": target_snr,
+        "noise_floor_snr": s_noise,
+        "overhead_s": overhead_s,
+        "overhead_model": None if slew is None else {
+            "readout_s": slew["readout_s"], "settle_s": slew["settle_s"],
+            "slew_rate_deg_s": slew["slew_rate_deg_s"],
+            "fov_width_deg": slew["fov_width_deg"],
+        },
     }
 
 
@@ -1260,13 +1415,61 @@ def _render_search_rate(d, meta, output_dir, plt, np) -> Path:
                    label=f"median lim. mag (50%) = {d['median_lim50']:.1f}")
     ax.set_xlabel("Apparent Magnitude (Catalog)")
     ax.set_ylabel(f"Search Rate (deg²/hour to TARGET {d['target_snr']:.0f}σ)")
+    om = d.get("overhead_model")
+    if om and om.get("fov_width_deg"):
+        oh_txt = (f"grid cadence overhead {d['overhead_s']:.1f}s = "
+                  f"readout {om['readout_s']:.1f}s + settle {om['settle_s']:.1f}s "
+                  f"+ {om['fov_width_deg']:.1f}° slew @ "
+                  f"{om['slew_rate_deg_s']:.1f}°/s")
+    else:
+        oh_txt = f"overhead {d['overhead_s']:.1f}s (default; slew fit unavailable)"
     ax.set_title(f"{meta['night_id']}: search rate vs magnitude "
-                 f"({d['n_stars']} isolated stars, sidereal; measured at "
-                 f"{d['min_meas_snr']:.0f}σ, rate scaled to TARGET "
-                 f"{d['target_snr']:.0f}σ)")
+                 f"({d['n_stars']} isolated stars, sidereal; SNR debiased by "
+                 f"{d.get('noise_floor_snr', 0):.2f}σ noise floor, scaled to "
+                 f"TARGET {d['target_snr']:.0f}σ)\n{oh_txt}", fontsize=10)
     ax.grid(True, alpha=0.3)
     ax.legend(loc="lower left", fontsize=9)
     return _save(fig, output_dir / "search_rate.png")
+
+
+def _data_slew_model(calib: NightCalibration):
+    return _fit_slew_model(calib.frames)
+
+
+def _render_slew_model(d, meta, output_dir, plt, np) -> Path:
+    dist = np.clip(np.asarray(d["dist"], float), 0.01, None)  # log axis: >0
+    over = np.asarray(d["overhead"], float)
+    readout, settle = d["readout_s"], d["settle_s"]
+    rate, bias = d["slew_rate_deg_s"], d["bias_s"]
+    fovw, grid = d["fov_width_deg"], d["grid_overhead_s"]
+
+    fig, ax = plt.subplots(figsize=(10, 7))
+    ax.scatter(dist, over, s=10, alpha=0.25, color="lightgray",
+               label=f"consecutive frame pairs (n={d['n_pairs']})")
+    env = d["env"]
+    if env["x"]:
+        ax.scatter(env["x"], env["y"], color="black", s=45, zorder=5,
+                   label=f"lower envelope (p{_SLEW_ENV_PCTILE} per bin)")
+    ax.axhline(readout, color="steelblue", ls=":", lw=1.6,
+               label=f"readout floor = {readout:.1f}s (no slew)")
+    xs = np.linspace(_SLEW_MIN_DEG, float(dist.max()), 200)
+    ax.plot(xs, bias + xs / rate, color="firebrick", lw=2.2,
+            label=(f"slew fit: {bias:.1f}s + sep / {rate:.1f}°/s   "
+                   f"(settle {settle:.1f}s, n_slew={d['n_slew']})"))
+    if fovw:
+        ax.axvline(fovw, color="seagreen", ls="--", lw=1.5, alpha=0.8)
+        ax.scatter([fovw], [grid], color="seagreen", s=160, marker="*", zorder=6,
+                   label=f"contiguous-grid step {fovw:.1f}° → cadence "
+                         f"overhead {grid:.1f}s")
+    ax.set_xscale("log")
+    ax.set_xlabel("Slew separation between consecutive frames (deg, alt/az)")
+    ax.set_ylabel("Inter-frame overhead  =  Δt − exposure  (s)")
+    ax.set_ylim(0, float(np.percentile(over, 98)))
+    ax.set_title(f"{meta['night_id']}: inter-frame overhead model "
+                 f"(readout + settle + slew)")
+    ax.grid(True, which="both", alpha=0.3)
+    ax.legend(loc="upper left", fontsize=9)
+    return _save(fig, output_dir / "slew_model.png")
 
 
 _PLOT_BUILDERS.update({
@@ -1277,6 +1480,7 @@ _PLOT_BUILDERS.update({
     "zp_drift": (_data_zp_drift, _render_zp_drift),
     "depth_vs_exposure": (_data_depth_vs_exposure, _render_depth_vs_exposure),
     "search_rate": (_data_search_rate, _render_search_rate),
+    "slew_model": (_data_slew_model, _render_slew_model),
 })
 
 
