@@ -1461,7 +1461,13 @@ _PSF_SAT_PEAK = 40000.0   # raw ADU; reject saturated stars (well below 65535)
 _PSF_ISO_RADIUS = 60.0    # px; no neighbor brighter than mag+2 within this
 _PSF_MAX_STARS = 200      # stamps to stack per frame
 _PSF_MIN_STARS_FRAME = 200  # need a well-populated field to pick from
-_PSF_MIN_STAMPS = 15      # min stacked stars for a usable profile
+_PSF_MIN_STAMPS = 20      # min stacked stars for a usable profile
+_PSF_MIN_PEAK_SNR = 20.0  # per-stamp peak/background-noise floor: below this the
+                          # max pixel is a noise spike, so peak-normalization
+                          # corrupts the stack (e.g. faint stars in a 1s frame)
+_PSF_FWHM_SANITY = 2.5    # reject a stack whose cut FWHM exceeds this × the
+                          # frame's detection FWHM (cosmic rays / settling-trailed
+                          # short frames stack to a meaningless broad blob)
 _PSF_N_BANDS = 3
 
 
@@ -1535,17 +1541,25 @@ def _psf_stack_stamp(fits_path: str, catalog_stars: list, fwhm: float, half: int
             continue
         ring = np.concatenate([st[0:4].ravel(), st[-4:].ravel(),
                                st[:, 0:4].ravel(), st[:, -4:].ravel()])
+        noise = float(np.std(ring))
         st -= np.median(ring)
-        mx = st.max()
-        if mx > _PSF_SAT_PEAK or mx <= 0:
+        # Cosmic rays / hot pixels are single-pixel spikes that can top the real
+        # star peak (common in short exposures); a 3×3 median filter is immune to
+        # them, so we take the peak / SNR / centroid from the filtered stamp. The
+        # raw stamp is what gets stacked — residual spikes wash out in the median.
+        sm = ndimage.median_filter(st, size=3)
+        peak = float(sm.max())
+        if peak <= 0 or peak > _PSF_SAT_PEAK:
             continue
-        cy, cx = ndimage.center_of_mass(np.clip(st, 0, None))
+        if noise <= 0 or peak < _PSF_MIN_PEAK_SNR * noise:
+            continue                        # noise-dominated stamp
+        cy, cx = ndimage.center_of_mass(np.clip(sm, 0, None))
         if not (np.isfinite(cx) and np.isfinite(cy)):
             continue
         if abs(cy - half) > fwhm or abs(cx - half) > fwhm:
             continue                        # centroid far off — blend/artifact
         st = ndimage.shift(st, (half - cy, half - cx), order=3, mode="nearest")
-        st /= st.max()
+        st /= peak
         stamps.append(st)
     if len(stamps) < _PSF_MIN_STAMPS:
         return None, 0
@@ -1586,6 +1600,52 @@ def _cut_fwhm(profile, np) -> float:
     return float(right - left)
 
 
+def _wcs_sky_axes(wcs_dict: dict):
+    """Unit vectors in pixel (x, y) space pointing East (+RA) and North (+Dec)
+    at the frame center, from the solved WCS header dict. Returns
+    (east_unit, north_unit) or None. Lets us cut the PSF along sky axes so an
+    elongation reads directly as RA vs Dec tracking error rather than detector
+    x/y (this camera is rotated ~35° + flipped relative to the sky)."""
+    if not wcs_dict:
+        return None
+    try:
+        import numpy as np
+        from astropy.io import fits
+        from astropy.wcs import WCS
+
+        hdr = fits.Header()
+        for k, v in wcs_dict.items():
+            if v is not None:
+                hdr[k] = v
+        w = WCS(hdr)
+        x0 = float(w.wcs.crpix[0]) - 1.0
+        y0 = float(w.wcs.crpix[1]) - 1.0
+        ra0, dec0 = (float(c) for c in w.all_pix2world(x0, y0, 0))
+        dd = 1.0 / 3600.0  # 1 arcsec step
+        xn, yn = (float(c) for c in w.all_world2pix(ra0, dec0 + dd, 0))
+        xe, ye = (float(c) for c in w.all_world2pix(
+            ra0 + dd / math.cos(math.radians(dec0)), dec0, 0))
+        north = np.array([xn - x0, yn - y0])
+        east = np.array([xe - x0, ye - y0])
+        nn, ne = np.linalg.norm(north), np.linalg.norm(east)
+        if not (np.isfinite(nn) and np.isfinite(ne) and nn > 0 and ne > 0):
+            return None
+        return east / ne, north / nn
+    except Exception:
+        return None
+
+
+def _sample_line(stamp, half, unit, np):
+    """Sample the stamp along a line through its center in pixel direction
+    ``unit`` (x, y), one sample per pixel from -half to +half."""
+    from scipy.ndimage import map_coordinates
+
+    t = np.arange(-half, half + 1.0)
+    xs = half + t * unit[0]
+    ys = half + t * unit[1]
+    return map_coordinates(stamp, [ys, xs], order=1, mode="constant", cval=0.0)
+
+
 def _data_psf_profile(calib: NightCalibration):
     import numpy as np
 
@@ -1616,7 +1676,7 @@ def _data_psf_profile(calib: NightCalibration):
             continue
         in_band.sort(key=lambda f: -f.zero_point)   # clearest first
         picked = None
-        for f in in_band[:8]:                        # try a few before giving up
+        for f in in_band[:12]:                       # try a few before giving up
             bp = batch_paths.get(f.batch_id)
             if not bp or not bp.is_file():
                 continue
@@ -1628,25 +1688,51 @@ def _data_psf_profile(calib: NightCalibration):
             if not fp or not Path(fp).is_file() or len(stars) < _PSF_MIN_STARS_FRAME:
                 continue
             stamp, n = _psf_stack_stamp(fp, stars, f.fwhm_px, half)
-            if stamp is not None:
-                picked = (f, stamp, n)
-                break
+            if stamp is None or stamp.max() <= 0:
+                continue
+            stamp = stamp / stamp.max()      # peak = 1 for radial & cuts alike
+            # Cut along sky axes (RA = East, Dec = North) when the WCS is
+            # available, so an elongation reads as a tracking error in RA vs Dec;
+            # else fall back to detector x/y.
+            sky = _wcs_sky_axes((fd.get("starfield") or {}).get("wcs") or {})
+            if sky is not None:
+                east_u, north_u = sky
+                cut_ra = _sample_line(stamp, half, east_u, np)
+                cut_dec = _sample_line(stamp, half, north_u, np)
+                axes_kind = "sky"
+            else:
+                east_u = north_u = None
+                cut_ra = stamp[half, :]
+                cut_dec = stamp[:, half]
+                axes_kind = "pixel"
+            fwhm_ra = _cut_fwhm(cut_ra, np)
+            fwhm_dec = _cut_fwhm(cut_dec, np)
+            # Reject implausible stacks (cosmic rays / settling-trailed short
+            # frames) so the band falls through to a clean frame.
+            if not (np.isfinite(fwhm_ra) and np.isfinite(fwhm_dec)
+                    and 0 < max(fwhm_ra, fwhm_dec) <= _PSF_FWHM_SANITY * f.fwhm_px):
+                continue
+            r, radial = _radial_profile(stamp, half, np)
+            picked = {
+                "fwhm_lo": lo, "fwhm_hi": hi, "fwhm_det": float(f.fwhm_px),
+                "fwhm_ra": float(fwhm_ra), "fwhm_dec": float(fwhm_dec),
+                "axes_kind": axes_kind,
+                "n_stars": int(n), "zp": float(f.zero_point),
+                "exposure": f.exposure_time,
+                "timestamp": f.timestamp.isoformat() if f.timestamp else None,
+                "axis": (np.arange(stamp.shape[0]) - half).tolist(),
+                "cut_ra": cut_ra.tolist(), "cut_dec": cut_dec.tolist(),
+                "r": r.tolist(), "radial": radial.tolist(),
+                "stamp2d": np.round(stamp, 4).tolist(),
+                "east_unit": (None if east_u is None
+                              else [float(east_u[0]), float(east_u[1])]),
+                "north_unit": (None if north_u is None
+                               else [float(north_u[0]), float(north_u[1])]),
+            }
+            break
         if picked is None:
             continue
-        f, stamp, n = picked
-        xcut = stamp[half, :]
-        ycut = stamp[:, half]
-        r, radial = _radial_profile(stamp, half, np)
-        bands.append({
-            "fwhm_lo": lo, "fwhm_hi": hi, "fwhm_det": float(f.fwhm_px),
-            "fwhm_x": _cut_fwhm(xcut, np), "fwhm_y": _cut_fwhm(ycut, np),
-            "n_stars": int(n), "zp": float(f.zero_point),
-            "exposure": f.exposure_time,
-            "timestamp": f.timestamp.isoformat() if f.timestamp else None,
-            "axis": (np.arange(stamp.shape[0]) - half).tolist(),
-            "x_cut": xcut.tolist(), "y_cut": ycut.tolist(),
-            "r": r.tolist(), "radial": radial.tolist(),
-        })
+        bands.append(picked)
     if not bands:
         return None
     psc = next((f.pixel_scale_arcsec for f in cands if f.pixel_scale_arcsec), None)
@@ -1657,20 +1743,54 @@ def _render_psf_profile(d, meta, output_dir, plt, np) -> Path:
     bands = d["bands"]
     half = d["half"]
     psc = d.get("pixel_scale_arcsec")
-    colors = plt.cm.viridis(np.linspace(0.12, 0.85, len(bands)))
-    fig, (axr, axc) = plt.subplots(1, 2, figsize=(13, 6))
+    nb = len(bands)
+    colors = plt.cm.viridis(np.linspace(0.12, 0.85, nb))
+    sky = all(b.get("axes_kind") == "sky" for b in bands)
+    a_name, b_name = ("RA", "Dec") if sky else ("x", "y")
+    win = min(half, max(12.0, max(
+        3.0 * max(b["fwhm_ra"], b["fwhm_dec"]) for b in bands)))
 
-    win = 0.0
+    # Layout: top row = one 2D heatmap per band; bottom row = radial (left half)
+    # + 1D cuts (right half). 2*nb columns so the bottom splits evenly.
+    fig = plt.figure(figsize=(max(13.0, 4.4 * nb), 10.5))
+    gs = fig.add_gridspec(2, 2 * nb, height_ratios=[1.05, 1.0])
+
+    for i, (b, c) in enumerate(zip(bands, colors)):
+        ax = fig.add_subplot(gs[0, 2 * i:2 * i + 2])
+        stamp = np.asarray(b["stamp2d"])
+        ext = [-half, half, -half, half]
+        ax.imshow(np.arcsinh(np.clip(stamp, 0, None) / 0.02), origin="lower",
+                  extent=ext, cmap="inferno")
+        grid = np.linspace(-half, half, stamp.shape[0])
+        ax.contour(grid, grid, stamp, levels=[0.5], colors="cyan", linewidths=1.0)
+        # N/E arrows so the heatmap is readable in sky orientation.
+        if b.get("north_unit") and b.get("east_unit"):
+            L = 0.7 * win
+            for u, name, col in ((b["north_unit"], "N", "white"),
+                                 (b["east_unit"], "E", "deepskyblue")):
+                ax.annotate("", xy=(L * u[0], L * u[1]), xytext=(0, 0),
+                            arrowprops=dict(arrowstyle="->", color=col, lw=1.4))
+                ax.text(L * 1.12 * u[0], L * 1.12 * u[1], name, color=col,
+                        fontsize=9, ha="center", va="center")
+        ax.set_xlim(-win, win)
+        ax.set_ylim(-win, win)
+        sec = f", {b['fwhm_det']*psc:.1f}\"" if psc else ""
+        ax.set_title(f"FWHM {b['fwhm_lo']:.1f}–{b['fwhm_hi']:.1f}px{sec}\n"
+                     f"{b['exposure']:.0f}s, {a_name}/{b_name}="
+                     f"{b['fwhm_ra']:.1f}/{b['fwhm_dec']:.1f}px, n={b['n_stars']}",
+                     fontsize=9)
+        ax.set_xlabel("Δx (px)")
+        if i == 0:
+            ax.set_ylabel("Δy (px)")
+
+    axr = fig.add_subplot(gs[1, :nb])
+    axc = fig.add_subplot(gs[1, nb:])
     for b, c in zip(bands, colors):
-        sec = f" ({b['fwhm_det']*psc:.1f}\")" if psc else ""
-        lbl = (f"FWHM {b['fwhm_lo']:.1f}–{b['fwhm_hi']:.1f}px{sec}  "
-               f"x/y={b['fwhm_x']:.1f}/{b['fwhm_y']:.1f}px, n={b['n_stars']}")
-        axr.plot(b["r"], np.clip(b["radial"], 1e-4, None), color=c, lw=2,
-                 label=lbl)
-        ax = b["axis"]
-        axc.plot(ax, b["x_cut"], color=c, lw=2.0, ls="-")
-        axc.plot(ax, b["y_cut"], color=c, lw=1.5, ls="--")
-        win = max(win, 3.0 * max(b["fwhm_x"], b["fwhm_y"]))
+        lbl = (f"FWHM {b['fwhm_lo']:.1f}–{b['fwhm_hi']:.1f}px  "
+               f"{a_name}/{b_name}={b['fwhm_ra']:.1f}/{b['fwhm_dec']:.1f}px")
+        axr.plot(b["r"], np.clip(b["radial"], 1e-4, None), color=c, lw=2, label=lbl)
+        axc.plot(b["axis"], b["cut_ra"], color=c, lw=2.0, ls="-")
+        axc.plot(b["axis"], b["cut_dec"], color=c, lw=1.5, ls="--")
 
     axr.set_yscale("log")
     axr.set_ylim(1e-3, 1.3)
@@ -1681,19 +1801,21 @@ def _render_psf_profile(d, meta, output_dir, plt, np) -> Path:
     axr.grid(True, which="both", alpha=0.3)
     axr.legend(fontsize=8, loc="upper right")
 
-    win = min(half, max(12.0, win))
     axc.axhline(0.5, color="gray", ls=":", lw=1)
     axc.set_xlim(-win, win)
     axc.set_ylim(-0.05, 1.05)
-    axc.set_xlabel("Δ from center (px)")
+    axc.set_xlabel("Δ from center along sky axis (px)" if sky
+                   else "Δ from center (px)")
     axc.set_ylabel("normalized flux")
-    axc.set_title("x cut (solid) & y cut (dashed)")
+    axc.set_title(f"{a_name} cut (E–W, solid) & {b_name} cut (N–S, dashed)"
+                  if sky else f"{a_name} cut (solid) & {b_name} cut (dashed)")
     axc.grid(True, alpha=0.3)
 
     scale_txt = f"   plate scale {psc:.2f}\"/px" if psc else ""
-    fig.suptitle(f"{meta['night_id']}: empirical PSF profile by seeing band "
-                 f"(clearest frame per band, median stack of isolated "
-                 f"stars){scale_txt}", fontsize=12)
+    axis_txt = ("RA/Dec → tracking-error direction" if sky else "detector x/y")
+    fig.suptitle(f"{meta['night_id']}: empirical PSF by seeing band — 2D stack, "
+                 f"radial & {axis_txt} cuts (median of isolated stars){scale_txt}",
+                 fontsize=12)
     fig.tight_layout(rect=[0, 0, 1, 0.96])
     return _save(fig, output_dir / "psf_profile.png")
 
