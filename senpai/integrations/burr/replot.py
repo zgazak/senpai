@@ -36,7 +36,7 @@ from senpai.engine.utils.file_io import load_fits_file, load_senpai_run
 logger = logging.getLogger(__name__)
 
 # Kinds the caller can request; "all" expands to everything.
-ALL_KINDS = ("review", "photometry", "aperture")
+ALL_KINDS = ("review", "photometry", "aperture", "psf")
 
 
 def find_batch_dirs(root: Path) -> list[Path]:
@@ -219,6 +219,58 @@ def _plot_aperture(img, frame, kind: str, out_dir: Path, force: bool) -> list[Pa
     return [ap_path] if ap_path.exists() else []
 
 
+def _plot_psf(img, frame, mode: str, out_dir: Path, force: bool) -> list[Path]:
+    """Per-frame empirical PSF panel. Prefers the saved .npy stamp (cheap, no FITS
+    reload); falls back to reloading the processed FITS and re-stacking (which
+    also re-writes the .npy), so panels regenerate even if psfs was off at run."""
+    from senpai.engine.plotting import psf as P
+
+    suffix = "psf" if mode == "sidereal" else "streak"
+    png = out_dir / f"frame_{frame.index}_{suffix}.png"
+    npy = out_dir / f"frame_{frame.index}_{suffix}.npy"
+    if not force and png.exists():
+        return []
+    sf = frame.starfield
+    if sf is None or not sf.catalog_stars:
+        return []
+    wcs = P._astropy_wcs(sf)
+    meta = {"index": frame.index, "exposure": P._exposure(frame),
+            "pixel_scale_arcsec": P._plate_scale(wcs)}
+    st = getattr(frame, "streak", None)
+    if mode == "rate" and (st is None or not st.pixel_length):
+        return []
+    try:
+        if not force and npy.exists():           # cheap: render from saved stamp
+            import numpy as np
+            stamp = np.load(npy)
+            if mode == "sidereal":
+                P.sidereal_from_stamp(stamp, wcs, meta, png)
+            else:
+                P.streak_from_stamp(stamp, wcs, float(st.fwhm),
+                                    float(st.pixel_length), float(st.degree_angle()),
+                                    meta, png)
+        else:                                    # reload-and-slice (re-stacks)
+            data = img.data if img is not None else None
+            if data is None:                     # fall back to the original FITS
+                op = getattr(frame, "original_frame_path", None)
+                if op and Path(op).exists():
+                    data = load_fits_file(op).data
+            if data is None:
+                return []
+            if mode == "sidereal":
+                fwhm = (getattr(getattr(frame, "seeing", None), "pixel_fwhm", None)
+                        or (sf.fwhm_stats.median_fwhm if sf.fwhm_stats else None) or 4.0)
+                P.make_sidereal_psf(data, P._stars(sf), wcs, float(fwhm), meta, png, npy)
+            else:
+                P.make_streak_psf(data, P._stars(sf), wcs, float(st.fwhm),
+                                  float(st.pixel_length), float(st.degree_angle()),
+                                  meta, png, npy)
+    except Exception as e:
+        logger.warning("frame %s: PSF panel failed: %s", frame.index, e)
+        return []
+    return [png] if png.exists() else []
+
+
 def replot_batch_dir(
     batch_dir: Path,
     kinds: tuple[str, ...] = ALL_KINDS,
@@ -247,7 +299,7 @@ def replot_batch_dir(
 
     for frame, mode in sorted(frames, key=lambda fm: fm[0].index):
         img = _resolve_frame_image(batch_dir, frame.processed_frame_path)
-        needs_img = "review" in kinds or "aperture" in kinds
+        needs_img = "review" in kinds or "aperture" in kinds or "psf" in kinds
         if img is None and needs_img:
             logger.warning(
                 "frame %s: processed FITS not found (%s); skipping image plots",
@@ -277,6 +329,9 @@ def replot_batch_dir(
             counts["aperture"] += len(
                 _plot_aperture(img, frame, mode, batch_dir, force)
             )
+
+        if "psf" in kinds:
+            counts["psf"] += len(_plot_psf(img, frame, mode, batch_dir, force))
 
     if gifs and "review" in kinds:
         run_id = run.id

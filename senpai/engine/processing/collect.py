@@ -719,6 +719,29 @@ def final_plots(senpai_run: SenpaiRun, output_dir: Path):
 
     run_id = config.runtime.run_id
 
+    # Per-frame empirical PSF panels (stacked stars for sidereal, stacked streak
+    # for rate). A small .npy stamp is saved next to each PNG so the panel can be
+    # regenerated later (see integrations.burr.replot) without the raw FITS.
+    if config.plotting.psfs:
+        from senpai.engine.plotting.psf import plot_rate_frame, plot_sidereal_frame
+
+        for f in senpai_run.sidereal_frames:
+            png = output_dir / f"frame_{f.index}_psf.png"
+            if not png.exists():
+                try:
+                    plot_sidereal_frame(f, png, output_dir / f"frame_{f.index}_psf.npy")
+                except Exception as e:
+                    logger.warning("PSF panel failed for sidereal frame %s: %s",
+                                   f.index, e)
+        for f in senpai_run.rate_track_frames:
+            png = output_dir / f"frame_{f.index}_streak.png"
+            if not png.exists():
+                try:
+                    plot_rate_frame(f, png, output_dir / f"frame_{f.index}_streak.npy")
+                except Exception as e:
+                    logger.warning("PSF panel failed for rate frame %s: %s",
+                                   f.index, e)
+
     for image_frame in senpai_run.sidereal_frames:
         output_file = output_dir / f"final_{image_frame.index}.png"
         if config.plotting.review and not output_file.exists():

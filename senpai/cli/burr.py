@@ -961,10 +961,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_plots.add_argument(
         "--kind", action="append", default=None,
-        choices=["all", "review", "photometry", "aperture"],
+        choices=["all", "review", "photometry", "aperture", "psf"],
         help="Plot kind(s); repeatable. 'review' = final_/raw_ overlays + GIFs, "
              "'photometry' = completeness + limiting-mag curves, 'aperture' = "
-             "per-star aperture overlay (re-runs cheap photometry). "
+             "per-star aperture overlay (re-runs cheap photometry), 'psf' = "
+             "per-frame empirical PSF panel (stacked stars / streak). "
              "Default: review + photometry (skips the heavy aperture overlay).",
     )
     p_plots.add_argument(

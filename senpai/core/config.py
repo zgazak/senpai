@@ -3,7 +3,7 @@ from pathlib import Path
 from typing import Optional
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
 
 logger = logging.getLogger(__name__)
 
@@ -36,10 +36,13 @@ class PlottingConfig(BaseModel):
     debug: bool = Field(description="Debug Plots")
     review: bool = Field(description="Review Plots")
     photometry: bool = Field(default=False, description="Photometry Plots")
-    streak: bool = Field(
+    psfs: bool = Field(
         default=False,
-        description="Streak PSF/refinement plots (small, ~<1MB each; separate "
-        "from the heavy `debug` kernel/CC plots)",
+        description="Per-frame empirical PSF plots: a stacked-star PSF panel for "
+        "sidereal frames and a stacked-streak panel for rate frames (small, "
+        "~<1MB each; separate from the heavy `debug` kernel/CC plots). A little "
+        ".npy stamp is saved alongside so the panels regenerate after the fact.",
+        validation_alias=AliasChoices("psfs", "streak"),
     )
 
 

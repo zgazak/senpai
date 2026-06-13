@@ -134,13 +134,14 @@ app:
     # aggregate calibration plots still come from `senpai-burr calibrate`.
     #
     # `debug` gates the heavy WCS kernel / cross-correlation plots — kept OFF.
-    # `streak` is a separate, lightweight flag (PSF/refinement panels, <1MB each,
-    # rate frames only) — left ON inline since they're cheap and the streak
-    # intermediates aren't (yet) persisted for post-hoc replot.
+    # `psfs` is a separate, lightweight flag: a per-frame empirical PSF panel
+    # (stacked stars for sidereal, stacked streak for rate; <1MB each). A small
+    # .npy stamp is saved alongside, so the panels also regenerate after the fact
+    # via `senpai-burr plots <dir>`. (Legacy key `streak:` still accepted.)
     debug: false
     review: false
     photometry: false
-    streak: true
+    psfs: true
   star_catalog:
     # Gaia DR3 (online) reaches G~21 — deeper than the frames' detection limit
     # (~mag 20), so the SNR/completeness curve rolls over within the data and we
