@@ -102,12 +102,16 @@ def extract_uct_time_from_header(header: dict[str, Any]) -> datetime:
         combined_datetime = arrow_date.replace(hour=hour, minute=minute, second=second, microsecond=microsecond)
         return combined_datetime.datetime
 
-    logger.error("no valid date header found in header")
-    logger.error(f"available header: {', '.join(list(header.keys()))}")
-    logger.error(f"coded DATE_TIME headers: {', '.join(DATE_TIME_HEADERS)}")
-    logger.error(f"coded DATE headers: {', '.join(DATE_HEADERS)}")
-    logger.error(f"coded TIME headers: {', '.join(TIME_HEADERS)}")
-    logger.error("YOU MUST HAVE A DATE_TIME or a DATE and a TIME")
+    # Debug-level: callers that can tolerate a missing time catch this raise and
+    # log a clean, actionable warning themselves (see organize_senpai_frames /
+    # extract_observation_time_from_header). Logging ERROR here made a handled,
+    # expected condition look like a failure (6 lines x 2 calls per frame).
+    logger.debug("no valid date header found in header")
+    logger.debug(f"available header: {', '.join(list(header.keys()))}")
+    logger.debug(f"coded DATE_TIME headers: {', '.join(DATE_TIME_HEADERS)}")
+    logger.debug(f"coded DATE headers: {', '.join(DATE_HEADERS)}")
+    logger.debug(f"coded TIME headers: {', '.join(TIME_HEADERS)}")
+    logger.debug("YOU MUST HAVE A DATE_TIME or a DATE and a TIME")
     raise AttributeError(f"no valid date header found in {header}")
 
 

@@ -178,7 +178,7 @@ def extract_filter_from_header(header: Header) -> str | None:
     return None
 
 
-def extract_observation_time_from_header(header: Header) -> float:
+def extract_observation_time_from_header(header: Header) -> datetime | None:
     config = get_config()
     for key in config.headers.observation_time.observation_time_keys:
         observation_time = extract_header_value(header, key)
@@ -193,11 +193,17 @@ def extract_observation_time_from_header(header: Header) -> float:
 
             return observation_time
 
-    # last ditch broad attempt
-    return extract_uct_time_from_header(header)
+    # Last-ditch broad attempt. Returns None (rather than raising) when no date
+    # header is present, so a header-sparse frame degrades gracefully instead of
+    # crashing the run.
+    try:
+        return extract_uct_time_from_header(header)
+    except AttributeError:
+        logger.warning("No observation-time header found; observation time unavailable")
+        return None
 
 
-def extract_exposure_time_from_header(header: Header) -> float:
+def extract_exposure_time_from_header(header: Header) -> float | None:
     config = get_config()
     for key in config.headers.exposure_time.exposure_time_keys:
         exposure_time = extract_header_value(header, key)

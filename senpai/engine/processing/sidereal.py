@@ -65,8 +65,12 @@ def process_astrometry_fits_sidereal(
     wcs_starfield.detection_metadata = DetectionMetadata(pixel_fwhm=initial_fwhm)
 
     if wcs_starfield.wcs:
-        # Create a SiderealFrame to pass to refine_sidereal_frame
-        timestamp = extract_uct_time_from_header(fits_image.header)
+        # Create a SiderealFrame to pass to refine_sidereal_frame. A header-sparse
+        # frame (no date) keeps a None timestamp rather than crashing refinement.
+        try:
+            timestamp = extract_uct_time_from_header(fits_image.header)
+        except AttributeError:
+            timestamp = None
         frame_metadata = FrameMetadata.from_header(fits_image.header)
         sidereal_frame = SiderealFrame(
             frame=fits_image,

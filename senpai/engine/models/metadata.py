@@ -114,8 +114,12 @@ class StreakMetadata(BaseModel):
 
 
 class FrameMetadata(BaseModel):
-    exposure_time_seconds: float
-    observation_time: datetime
+    # Optional so frames with sparse/absent headers (e.g. a raw focus frame with
+    # only NAXIS) still build a FrameMetadata. Downstream features that need a
+    # value gate on its presence (see FrameMetadata.missing_capabilities) rather
+    # than crashing the run.
+    exposure_time_seconds: float | None = None
+    observation_time: datetime | None = None
     site: SiteMetadata | None = None
     track_mode: TrackMode | None = None
     track_rate_ra_arcsec_per_second: float | None = None
@@ -130,6 +134,56 @@ class FrameMetadata(BaseModel):
         if self.observation_time:
             data["observation_time"] = self.observation_time.isoformat()
         return FrameMetadata(**data)
+
+    def missing_capabilities(self) -> list[tuple[str, str]]:
+        """Audit which header-derived values are absent and what each disables.
+
+        Returns a list of ``(missing_data, disabled_capability)`` pairs so a
+        caller can log verbosely *what* could not run and *why*. Empty list
+        means every header-gated feature has the data it needs.
+        """
+        gaps: list[tuple[str, str]] = []
+        if self.observation_time is None:
+            gaps.append((
+                "observation time (e.g. DATE-OBS)",
+                "multi-frame time ordering falls back to input order; "
+                "time-based streak/rate correlation is disabled",
+            ))
+        if self.exposure_time_seconds is None:
+            gaps.append((
+                "exposure time (e.g. EXPTIME)",
+                "exposure-normalized photometry (per-second magnitudes in "
+                "detection/forced photometry) and rate conversion (pixels/s -> "
+                "arcsec/s) are disabled; the catalog zero-point and limiting "
+                "magnitude are still computed (instrumental, count-based)",
+            ))
+        if self.boresight_ra_degrees is None or self.boresight_dec_degrees is None:
+            gaps.append((
+                "boresight pointing (RA/DEC or AZ/ALT)",
+                "plate solve runs blind (no RA/Dec hint) — slower, no constrained refine tier",
+            ))
+        if self.site is None:
+            gaps.append((
+                "observing site (lat/long/elev)",
+                "airmass / observability metrics are disabled",
+            ))
+        if self.observation_filter is None:
+            gaps.append((
+                "filter (e.g. FILTER)",
+                "band-specific photometric calibration falls back to a generic band",
+            ))
+        return gaps
+
+    def log_missing_capabilities(self, logger, label: str = "frame") -> None:
+        """Emit one warning per missing-header capability gap (verbose by design)."""
+        gaps = self.missing_capabilities()
+        if not gaps:
+            return
+        logger.warning(
+            "%s: %d header value(s) missing — degrading gracefully:", label, len(gaps)
+        )
+        for missing, disabled in gaps:
+            logger.warning("  - missing %s -> %s", missing, disabled)
 
     @classmethod
     def from_header(cls, header: Header) -> "FrameMetadata":

@@ -35,7 +35,7 @@ class SiderealFrameSerializable(BaseModel):
     processing_history: list | None = None  # Store processing history for calibration reproduction
     correction_frames: dict | None = None  # Store correction frames for calibration reproduction
     index: int
-    timestamp: str  # Changed from datetime to str for serialization
+    timestamp: str | None = None  # ISO string; None when the frame has no time header
     frame_metadata: FrameMetadata | None = None
     photometry_summary: dict | None = None
     streak_candidates: list[dict] = []
@@ -48,7 +48,7 @@ class SiderealFrame(BaseModel):
     detections: SatelliteListImage | None = None
     frame: ProcessedFitsImage
     index: int
-    timestamp: datetime
+    timestamp: datetime | None = None  # None when the frame has no time header
     frame_metadata: FrameMetadata | None = None
     photometry_summary: dict | None = None
     streak_candidates: list = []
@@ -67,7 +67,7 @@ class RateTrackFrameSerializable(BaseModel):
     processing_history: list | None = None  # Store processing history for calibration reproduction
     correction_frames: dict | None = None  # Store correction frames for calibration reproduction
     index: int
-    timestamp: str
+    timestamp: str | None = None  # ISO string; None when the frame has no time header
     pixel_track_rate_per_second: float | None = None
     photometry_summary: dict | None = None
     streak_candidates: list[dict] = []
@@ -86,7 +86,7 @@ class RateTrackFrame(BaseModel):
     frame_metadata: FrameMetadata | None = None
     frame: ProcessedFitsImage
     index: int
-    timestamp: datetime
+    timestamp: datetime | None = None  # None when the frame has no time header
     pixel_track_rate_per_second: float | None = None
     photometry_summary: dict | None = None
     streak_candidates: list = []
@@ -110,7 +110,7 @@ class FrameSummary(BaseModel):
     """Compact per-frame summary with actionable information only."""
 
     index: int
-    timestamp: str
+    timestamp: str | None = None  # ISO string; None when the frame has no time header
     track_mode: str | None = None  # "sidereal" / "rate"
     original_frame_path: str | None = None
     processed_frame_path: str | None = None
@@ -250,18 +250,36 @@ class SenpaiRun(BaseModel):
         sidereal_frames = []
         rate_track_frames = []
 
-        # Sort frames by time
-        frames_with_time = []
+        # Sort frames by time. A frame with no usable date header keeps its
+        # input position rather than crashing the run (focus/raw frames often
+        # carry only NAXIS); timed frames sort ahead of untimed ones.
+        timed: list[tuple[ProcessedFitsImage, datetime]] = []
+        untimed: list[ProcessedFitsImage] = []
         for frame in frames:
-            frame_time = extract_uct_time_from_header(frame.header)
-            frames_with_time.append((frame, frame_time))
+            try:
+                frame_time = extract_uct_time_from_header(frame.header)
+                timed.append((frame, frame_time))
+            except AttributeError:
+                fname = Path(frame.file_path).name if frame.file_path else "?"
+                logger.warning(
+                    "Frame %s has no usable date/time header — keeping input order; "
+                    "time-based frame ordering and correlation are disabled for it",
+                    fname,
+                )
+                untimed.append(frame)
 
-        # Sort by frame_time
-        frames_with_time.sort(key=lambda x: x[1])
+        timed.sort(key=lambda x: x[1])
+        ordered: list[tuple[ProcessedFitsImage, datetime | None]] = (
+            [(f, t) for f, t in timed] + [(f, None) for f in untimed]
+        )
 
         # Process frames in time order and assign sequential indexes
-        for index, (frame, timestamp) in enumerate(frames_with_time):
+        for index, (frame, timestamp) in enumerate(ordered):
             frame_metadata = FrameMetadata.from_header(frame.header)
+
+            # Verbose audit: log every header-gated capability this frame loses.
+            fname = Path(frame.file_path).name if frame.file_path else f"index {index}"
+            frame_metadata.log_missing_capabilities(logger, label=f"Frame {fname}")
 
             header_track_type = frame_metadata.track_mode
             if force_track_mode is not None:
