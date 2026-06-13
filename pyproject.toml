@@ -53,6 +53,15 @@ dev = [
 [tool.uv]
 override-dependencies = ["pydantic>=2.11"]
 
+# astroeasy is co-developed in a sibling checkout: this branch needs the cascade
+# / catalog.mirror modules (astroeasy 1.1.0), which are NOT yet on PyPI. Pulling
+# it editable from the local source keeps `uv sync` from reverting to the locked
+# PyPI 1.0.14 (which lacks those modules and breaks solver_mode=chain).
+# MERGE PREREQUISITE: before merging to main, publish astroeasy >=1.1.0 to PyPI,
+# drop this [tool.uv.sources] entry, and bump the dependency pin to >=1.1.0.
+[tool.uv.sources]
+astroeasy = { path = "../astroeasy", editable = true }
+
 [tool.pytest.ini_options]
 testpaths = ["tests", "senpai/engine/tests", "senpai/api/tests"]
 addopts = "--cov-report=term-missing"
