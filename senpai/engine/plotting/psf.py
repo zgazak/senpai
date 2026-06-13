@@ -133,7 +133,7 @@ def _isolated_order(xy, mags, iso_radius):
             yield int(i)
 
 
-def stack_stars(data, stars, fwhm, half=SIDEREAL_HALF, max_stars=MAX_STARS):
+def stack_stars(data, stars, fwhm, half=None, max_stars=MAX_STARS):
     """Median-stacked, peak-normalized point-source PSF (sidereal).
 
     ``stars`` is a list of (x, y, mag). Returns (stamp, n) or (None, 0)."""
@@ -141,12 +141,23 @@ def stack_stars(data, stars, fwhm, half=SIDEREAL_HALF, max_stars=MAX_STARS):
             if s[0] is not None and s[1] is not None]
     if len(keep) < 20:
         return None, 0
+    # The stamp must hold the whole PSF *plus* a clean sky border, because the
+    # outer 4px ring is what sets the per-stamp background/noise and the
+    # peak-SNR gate. A fixed 30px half is too small for a defocused or strongly
+    # aberrated PSF (FWHM >~ 15px): its donut reaches the border, the "sky" ring
+    # samples PSF wings, noise is overestimated and peak-SNR collapses — so
+    # every stamp is rejected and the panel silently vanishes exactly when it is
+    # most diagnostic. Scale the stamp (and the isolation radius) with FWHM,
+    # floored at SIDEREAL_HALF for well-focused frames.
+    if half is None:
+        half = int(max(SIDEREAL_HALF, round(3.0 * fwhm)))
+    isolation = max(60.0, half + fwhm)  # neighbors clear of the stamp footprint
     xy = np.array([(s[0], s[1]) for s in keep])
     mags = np.array([s[2] for s in keep])
     h, w = data.shape
     n = 2 * half + 1
     stamps = []
-    for i in _isolated_order(xy, mags, max(60.0, 2.0 * fwhm)):
+    for i in _isolated_order(xy, mags, isolation):
         if len(stamps) >= max_stars:
             break
         x, y = xy[i]
