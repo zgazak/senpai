@@ -18,7 +18,7 @@ from senpai.engine.models.senpai import (
     SenpaiRunResult,
     SiderealFrameSerializable,
 )
-from senpai.integrations.burr.replot import (
+from senpai.engine.plotting.replot import (
     _find_result_json,
     find_batch_dirs,
     replot_batch_dir,
@@ -113,7 +113,7 @@ def test_streak_candidate_objs_wraps_dicts():
     """Serializable streak_candidates are dicts; plot_single_frame reads them by
     attribute. The wrapper must expose .x/.length_pixels etc. (regression: the
     full replot failed 6 batches with 'dict' object has no attribute 'x')."""
-    from senpai.integrations.burr.replot import _streak_candidate_objs
+    from senpai.engine.plotting.replot import _streak_candidate_objs
 
     assert _streak_candidate_objs(None) is None
     assert _streak_candidate_objs([]) is None

@@ -721,7 +721,7 @@ def final_plots(senpai_run: SenpaiRun, output_dir: Path):
 
     # Per-frame empirical PSF panels (stacked stars for sidereal, stacked streak
     # for rate). A small .npy stamp is saved next to each PNG so the panel can be
-    # regenerated later (see integrations.burr.replot) without the raw FITS.
+    # regenerated later (see engine.plotting.replot) without the raw FITS.
     if config.plotting.psfs:
         from senpai.engine.plotting.psf import plot_rate_frame, plot_sidereal_frame
 

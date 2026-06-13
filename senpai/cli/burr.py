@@ -617,7 +617,7 @@ def cmd_plots(args: argparse.Namespace) -> int:
     re-processing), so plotting is decoupled from the slow night pipeline and
     iterating on a plot never costs a re-run.
     """
-    from senpai.integrations.burr.replot import ALL_KINDS, replot
+    from senpai.engine.plotting.replot import ALL_KINDS, replot
 
     config = initialize_config(Path(args.config))
     set_log_level(config.logging.level)
